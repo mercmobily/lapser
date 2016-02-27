@@ -14,7 +14,7 @@ Reasons:
 * Ability to have different independent profiles
 * A nice timestamp and specific label is added to each screenshot (and therefore the movie)
 * The screenshots for a timelaps are firstly archived, and then converted to a movie in MP4 format
-* Dependencies are simply ffmpeg and yad
+* Dependencies are simply ffmpeg, Imagemagick and Yad
 
 ## Limitations
 
