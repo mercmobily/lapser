@@ -21,6 +21,10 @@ Reasons:
 * Upload of videos to remote server not yet implemented
 * Dual monitor is not yet managed
 
+## Demo
+
+[![Lapser in action](http://img.youtube.com/vi/Yj-2S86I6f/0.jpg)](http://www.youtube.com/watch?v=Yj-2S86I6f "Lapser in action")
+
 ## Final notes
 
 I wrote this in less than 2 days, and with very rusty knowledge of bash.
