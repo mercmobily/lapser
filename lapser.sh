@@ -17,6 +17,7 @@ set_profile_dirs(){
   PROFILE_DIR="$DATA_DIR"/profiles/"$profile"
   LABEL_FILE="$PROFILE_DIR"/working_on.txt
   CONFIG_FILE="$PROFILE_DIR"/config.cfg
+  LOG_FILE="$PROFILE_DIR"/log.txt
   SHOTS_CURRENT_DIR="$PROFILE_DIR"/current_shots
   SHOTS_NOT_CONVERTED_DIR="$PROFILE_DIR"/shots_archived_not_converted
   SHOTS_CONVERTED_DIR="$PROFILE_DIR"/shots_archived_converted
@@ -29,7 +30,7 @@ set_profile_dirs(){
     fi
   done
 
-  for f in "$LABEL_FILE" "$CONFIG_FILE";do
+  for f in "$LABEL_FILE" "$LOG_FILE" "$CONFIG_FILE";do
     if [ ! -f "$f" ]; then
       echo -n > "$f"
     fi
@@ -76,9 +77,9 @@ how_many_current_shots(){
 
 
 monitor(){
-  # DEBUG, PUT BACK TO 15
-  #threshold='15';
-  threshold='1';
+  # DEBUG, PUT BACK TO 15 AFTER DEBUGGING
+  threshold='15';
+  #threshold='1';
   timestamp=$SECONDS
   while sleep 1; do 
  
@@ -93,7 +94,7 @@ monitor(){
       timestamp=$new_timestamp
 
       # Get label variables ready
-      now=$(date +"%Y-%m-%d-%H.%M.%S")
+      now=$(date +"%Y-%m-%d_%H.%M.%S")
       label=`cat "$LABEL_FILE"`
 
       # Make screenshot
@@ -136,19 +137,18 @@ the_program(){
     --form \
     --field="Working on..." \
     --button="Start capturing:2" \
-    --button="Config:4" \
     --button="Archive:6" \
     --button="Convert to movie:8" \
     --button="Upload:10" \
+    --button="Config:4" \
     --button="Cancel:17" \
     --center \
     "$working_on" )
   
     ret=$?
   
-    # This gets saved regardless
+    # This gets saved regardless (unless ESCAPing or CANCELing)
     if [ $ret -ne 17 -a $ret -ne 252 ];then
-      echo SAVING WORKING_ON
       working_on=`echo $res | cut -d '|' -f 1`
       echo "$working_on" > $LABEL_FILE
     fi
@@ -163,12 +163,16 @@ the_program(){
         first_shot=$(first_current_shot)
         extra_text="This capture started on $first_shot"
       fi
-  
+
+      d=$(date +"%Y-%m-%d_%H.%M.%S")
+      label=`cat "$LABEL_FILE"`
+      echo $d - START $label >> $LOG_FILE
       monitor | yad --progress --title="Capturing for $profile" --progress-text="Capturing in progress. $extra_text" --text="Press Cancel to stop capturing" --center
+      d=$(date +"%Y-%m-%d_%H.%M.%S")
+      echo $d - STOP $label >> $LOG_FILE
   
     # #4: Config
     elif [ $ret -eq 4 ];then
-      echo "CONFIG"
   
       res=$(yad \
       --width=600 \
@@ -186,7 +190,6 @@ the_program(){
       ret=$?
   
       if [ $ret -eq 2 -o $ret -eq 0 ];then
-        echo SAVING
         cfg_user=`echo $res | cut -d '|' -f 1`
         cfg_password=`echo $res | cut -d '|' -f 2`
         cfg_server=`echo $res | cut -d '|' -f 3`
@@ -198,10 +201,8 @@ the_program(){
   
     # #6: Archive
     elif [ $ret -eq 6 ];then
-      echo "ARCHIVE SELETED"
   
       how_many=$(how_many_current_shots)
-      echo "HOW MANY: $how_many"
   
       if [ $how_many -le 4 ];then
         yad_message "Less than 4 screenshots taken, too early to archive"
@@ -214,20 +215,27 @@ the_program(){
           yad_message "Error working out the name of the destination folder!"
         else 
       
+         log=$(cat $LOG_FILE)
+
           yad \
           --width=600 \
+          --height=400 \
           --title="Are you sure?" \
-          --text="This will archive the current time lapse.\n\n(From $first_file to $last_file)\n\nAre you sure?" \
-          --center
+          --text="This will archive the current time lapse.\n\n(From $first_file to $last_file)\n\n" \
+          --form \
+          --field="Log entries that will be attached to the archive:TXT" \
+          --center \
+          "$log"
+
           ret=$?
-          echo $ret
   
           if [ $ret -eq 0 ];then
      
-          echo "ARCHIVE RUN"
           to="$first_file"_TO_"$last_file" 
           mkdir "$SHOTS_NOT_CONVERTED_DIR"/"$to"
           mv "$SHOTS_CURRENT_DIR"/* "$SHOTS_NOT_CONVERTED_DIR"/"$to"
+          cp "$LOG_FILE" "$SHOTS_NOT_CONVERTED_DIR"/"$to"
+          > "$LOG_FILE"
           yad_message "Archive created, timestamp: $to"
         fi
       fi
@@ -235,7 +243,6 @@ the_program(){
   
     # #8: Convert to movie
     elif [ $ret -eq 8 ];then
-      echo "CONVERT TO MOVIE SELECTED"
      
       list='';
       for f in "$SHOTS_NOT_CONVERTED_DIR"/*;do
@@ -253,30 +260,29 @@ the_program(){
       "$list")
       ret=$?
   
-      echo "RET/PICKED: $ret/$pick"
       if [ $ret -ne 1 -a $ret -ne 252 ];then
         pick=`echo $pick | cut -d '|' -f 1`
   
-        ffmpeg28 -y -framerate 4  -pattern_type glob -i "$SHOTS_NOT_CONVERTED_DIR"/"$pick"/'*.jpg' /tmp/video.${PID}.mp4
+        ffmpeg -y -framerate 4  -pattern_type glob -i "$SHOTS_NOT_CONVERTED_DIR"/"$pick"/'*.jpg' -b:v 800k /tmp/video.${PID}.mp4
   
         ret=$?
   
         if [ "$ret" -ne 0 ];then
           yad_message "Video creation failed"
         else
+          # Move the screenshots to the "CONVERTED" directory
           mv "$SHOTS_NOT_CONVERTED_DIR"/"$pick" "$SHOTS_CONVERTED_DIR"
+          # Move the freshly generated video over
           mv /tmp/video.${PID}.mp4  "$MOVIES_NOT_UPLOADED_DIR"/"$pick".mp4
+          # Copy the log file over, named as the video
+          cp "$SHOTS_CONVERTED_DIR"/"$pick"/log.txt "$MOVIES_NOT_UPLOADED_DIR"/"$pick".log
           yad_message "Conversion successful!"
         fi
       fi
   
-      # -vb 20M
-      # -b:v 500k
-  
   
     # #8: Upload
     elif [ $ret -eq 10 ];then
-      echo "UPLOAD SELECTED"
       
        yad \
       --width=600 \
@@ -284,15 +290,9 @@ the_program(){
       --text="This will upload the existing movies to the remote server\nAre you sure?" \
       --center
       ret=$?
-      echo $ret
-  
-      if [ $ret -eq 0 ];then
-        echo "UPLOADING RUN"
-      fi
   
     # #4: The end
     elif [ $ret -eq 4 -o $ret -eq 252 ];then
-     #exit 0;
      return
     fi
   
@@ -351,6 +351,7 @@ while true;do
 
       ret=$?
   
+      # Pressed enter on the field, or the "Create" button
       if [ $ret -eq 2 -o $ret -eq 0 ];then
        res=`echo $res | cut -d '|' -f 1`
        set_profile_dirs $res 
