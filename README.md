@@ -18,7 +18,7 @@ Reasons:
 
 ## Limitations
 
-* Upload of videos to remote server not yet implemented
+* Upload of videos to remote server not yet implemented (coming as soon as I need it)
 * Dual monitor is not yet managed
 
 ## Demo

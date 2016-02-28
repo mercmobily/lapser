@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# This means that * will return nothing rather than "*"
+shopt -s nullglob
+
 # Global variables
 DATA_DIR="$HOME/.lapser"
 
@@ -301,13 +304,8 @@ the_program(){
   
   # TODO:
   # ----
-  
-  # * Fix cycle, so that first yad calls second one and back to first
   # * Write rsync call to upload/move videos
   
-  # * Check if this command makes better videos smaller
-  # convert 0.png -background black -flatten +matte 0_opaque.png
-  # http://stackoverflow.com/questions/3561715/using-ffmpeg-to-encode-a-high-quality-video|
 } 
  
 
