@@ -23,7 +23,7 @@ Reasons:
 
 ## Demo
 
-[![Lapser in action](http://img.youtube.com/vi/Yj-2S86I6f/0.jpg)](http://www.youtube.com/watch?v=Yj-2S86I6f "Lapser in action")
+[![Lapser in action](http://img.youtube.com/vi/Yj-2S86I6fe/0.jpg)](http://www.youtube.com/watch?v=Yj-2S86I6fe "Lapser in action")
 
 ## Final notes
 
