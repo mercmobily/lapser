@@ -23,6 +23,12 @@ Reasons:
 
 ## Demo
 
+This is a demo of what will come out. Please note that this _actually_ covers the full development of Lapser: I ran just the script to make 1 screenshot every 15 seconds, and then developed all of the app with the script going. I then fed those screenshots back to Lapser.
+
+You can see at the beginning how I got stuck (really stuck!) with the problem that FFMPEG will not work properly if the input file has a semicolon in it. The rest of the work was about learning YAD and getting the program to actually work.
+
+The girl in the background is my wife Chiara.
+
 [![Lapser in action](http://img.youtube.com/vi/Yj-2S86I6fo/0.jpg)](http://www.youtube.com/watch?v=Yj-2S86I6fo "Lapser in action")
 
 
