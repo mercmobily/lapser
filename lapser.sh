@@ -266,7 +266,7 @@ the_program(){
       if [ $ret -ne 1 -a $ret -ne 252 ];then
         pick=`echo $pick | cut -d '|' -f 1`
   
-        ffmpeg -y -framerate 4  -pattern_type glob -i "$SHOTS_NOT_CONVERTED_DIR"/"$pick"/'*.jpg' -b:v 800k /tmp/video.${PID}.mp4
+        ffmpeg -y -framerate 4  -pattern_type glob -i "$SHOTS_NOT_CONVERTED_DIR"/"$pick"/'*.jpg' -b:v 800k -pix_fmt yuv420p /tmp/video.${PID}.mp4
   
         ret=$?
   
