@@ -1,0 +1,3323 @@
+#!/usr/bin/env python3
+#
+# ==============================================================================
+# ==============================================================================
+# LAPSER3 FILE MAP
+# ==============================================================================
+# ==============================================================================
+#
+# This is intentionally a single-file executable.  It is divided into named
+# sections so the file can stay portable in ~/bin while still being readable.
+#
+# IMPORTS AND RUNTIME SETUP
+#   Python imports, GI version pinning, optional DBus import, and locale setup.
+#
+# CONFIGURATION AND CONSTANTS
+#   Paths, timings, filename conventions, external command names, page IDs,
+#   GStreamer/portal constants, and shared type aliases.
+#
+# APPLICATION STYLESHEET
+#   The GTK CSS used by the application.
+#
+# DOMAIN TYPES AND ERRORS
+#   Exceptions, protocols, immutable data objects, dependency status, and
+#   capture job state.
+#
+# DISPLAY AND NAMING HELPERS
+#   Locale-aware dates, Lapser filename display, converted-set naming, and
+#   small value helpers.
+#
+# PROFILE, FILE, AND MEDIA HELPERS
+#   Profile directory setup, text/log files, screenshot/video discovery,
+#   thumbnail cache management, media signatures, and lifecycle file moves.
+#
+# DEPENDENCY CHECKS
+#   Startup checks for external commands, GStreamer elements, DBus support,
+#   and the command-line dependency report.
+#
+# GTK WIDGET HELPERS
+#   Small reusable widget factories and container utilities used by the UI.
+#
+# CAPTURE BACKENDS
+#   Full-screen capture, portal-selected window capture, and PipeWire/GStreamer
+#   snapshot handling.
+#
+# MAIN WINDOW
+#   The libadwaita application window, profile sidebar, lifecycle tabs,
+#   filesystem access and drag export, thumbnail grid, video playback, capture
+#   loop, deletion, conversion, and upload state transitions.
+#
+# APPLICATION ENTRY POINT
+#   Application object, startup CSS installation, activation, and main().
+#
+# ==============================================================================
+# ==============================================================================
+# SECTION: IMPORTS AND RUNTIME SETUP
+# DESCRIPTION: Python imports, GI version pinning, optional DBus import, and
+#              locale setup that must happen before the rest of the module.
+# ==============================================================================
+# ==============================================================================
+
+from __future__ import annotations
+
+import os
+import locale
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Protocol, Sequence
+
+import gi
+
+gi.require_version("Adw", "1")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gst", "1.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gst, Gtk, Pango
+
+try:
+    import dbus
+    import dbus.mainloop.glib
+except ImportError:
+    dbus = None
+
+
+try:
+    locale.setlocale(locale.LC_TIME, "")
+except locale.Error:
+    pass
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: CONFIGURATION AND CONSTANTS
+# DESCRIPTION: Paths, timings, filename conventions, external command names,
+#              page IDs, GStreamer/portal constants, and shared type aliases.
+# ==============================================================================
+# ==============================================================================
+
+DATA_DIR = Path.home() / ".lapser"
+APP_ID = "local.lapser3"
+DEFAULT_PROFILE_NAME = "default"
+
+CAPTURE_INTERVAL_SECONDS = 15
+MIN_SHOTS_TO_CONVERT = 5
+LOAD_MORE_DELAY_MS = 50
+DELETE_FINALIZE_DELAY_SECONDS = 30
+DELETE_UNDO_TOAST_SECONDS = 8
+STAGED_DELETE_RETENTION_SECONDS = 24 * 60 * 60
+CONVERSION_CANCEL_KILL_DELAY_SECONDS = 2
+PORTAL_REQUEST_TIMEOUT_SECONDS = 300
+
+THUMB_WIDTH = 224
+THUMB_HEIGHT = 126
+THUMBNAIL_BATCH_SIZE = 300
+THUMBNAIL_QUALITY = "82"
+THUMB_FLOW_MIN_COLUMNS = 3
+THUMB_FLOW_MAX_COLUMNS = 8
+SCREENSHOT_ANNOTATION_HEIGHT = 22
+SCREENSHOT_ANNOTATION_POINT_SIZE = 18
+WINDOW_SNAPSHOT_JPEG_QUALITY = 90
+
+VIDEO_FRAMERATE = 4
+VIDEO_BITRATE = "800k"
+VIDEO_PIXEL_FORMAT = "yuv420p"
+FFMPEG_PROGRESS_LIMIT = 0.97
+POST_ENCODE_PROGRESS = 0.98
+
+SIDEBAR_MIN_WIDTH = 118
+SIDEBAR_ROW_CHROME_WIDTH = 45
+SIDEBAR_HEADER_CHROME_WIDTH = 58
+
+PAGE_CURRENT = "current"
+PAGE_CONVERTED = "converted"
+PAGE_CONVERTED_DETAIL = "converted-detail"
+PAGE_PENDING_VIDEOS = "pending-videos"
+PAGE_UPLOADED_VIDEOS = "uploaded-videos"
+
+LAPSER_TIMESTAMP_FORMAT = "%Y-%m-%d_%H.%M.%S"
+CONVERTED_SET_SEPARATOR = "_TO_"
+JPG_SUFFIX = ".jpg"
+VIDEO_SUFFIX = ".mp4"
+LOG_SUFFIX = ".log"
+TEMP_JPG_SUFFIX = ".tmp.jpg"
+MEDIA_SUFFIXES = {JPG_SUFFIX, ".jpeg", VIDEO_SUFFIX, LOG_SUFFIX}
+
+COMMAND_IMAGEMAGICK_CONVERT = "convert"
+COMMAND_FFMPEG = "ffmpeg"
+COMMAND_GNOME_SCREENSHOT = "gnome-screenshot"
+COMMAND_GSETTINGS = "gsettings"
+DEPENDENCY_IMAGEMAGICK_CONVERT = "ImageMagick convert"
+DEPENDENCY_PYTHON_DBUS = "python3-dbus"
+GSETTINGS_INTERFACE_SCHEMA = "org.gnome.desktop.interface"
+GSETTINGS_ENABLE_ANIMATIONS_KEY = "enable-animations"
+GSTREAMER_SNAPSHOT_ELEMENTS = (
+    "pipewiresrc",
+    "queue",
+    "videoconvert",
+    "capsfilter",
+    "jpegenc",
+    "filesink",
+)
+INSTALL_TARGETS = {
+    DEPENDENCY_IMAGEMAGICK_CONVERT: "ImageMagick (provides convert)",
+    COMMAND_FFMPEG: "ffmpeg",
+    COMMAND_GNOME_SCREENSHOT: "gnome-screenshot",
+    COMMAND_GSETTINGS: "gsettings / GLib",
+    DEPENDENCY_PYTHON_DBUS: "python3-dbus",
+}
+
+PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
+PORTAL_OBJECT_PATH = "/org/freedesktop/portal/desktop"
+SCREENCAST_IFACE = "org.freedesktop.portal.ScreenCast"
+REQUEST_IFACE = "org.freedesktop.portal.Request"
+SESSION_IFACE = "org.freedesktop.portal.Session"
+GST_CAPTURE_TIMEOUT = 10 * Gst.SECOND
+
+SignatureEntry = tuple[str, int, int]
+MediaSignature = tuple[SignatureEntry, ...]
+ShotCacheKey = SignatureEntry
+ThumbnailSignature = tuple[MediaSignature, int]
+ThumbnailWidgetKey = tuple[str, str, int, int]
+ThumbnailQueueItem = tuple[str, str, Path, ShotCacheKey]
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: APPLICATION STYLESHEET
+# DESCRIPTION: GTK CSS used by the window, sidebar, thumbnail grid, media rows,
+#              dependency banner, and inline profile creation controls.
+# ==============================================================================
+# ==============================================================================
+
+CSS = """
+.sidebar-pane {
+  background: @sidebar_bg_color;
+}
+
+.sidebar-title {
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+.profile-row {
+  padding: 5px 6px;
+}
+
+.profile-name {
+  font-weight: 600;
+}
+
+.muted {
+  opacity: 0.68;
+}
+
+.profile-heading {
+  font-size: 1.35em;
+  font-weight: 700;
+}
+
+.section-heading {
+  font-weight: 700;
+}
+
+.status-pill {
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: alpha(@accent_bg_color, 0.16);
+  color: @accent_color;
+  font-weight: 600;
+}
+
+.quiet-pill {
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: alpha(currentColor, 0.08);
+}
+
+.thumb-card {
+  background: @card_bg_color;
+  border-radius: 8px;
+  padding: 6px;
+  margin: 6px;
+  box-shadow: 0 1px 3px alpha(black, 0.18);
+}
+
+.thumb-delete {
+  margin: 6px;
+}
+
+.archive-row {
+  padding: 8px 10px;
+}
+
+.lifecycle-tabs {
+  margin-top: 4px;
+}
+
+.media-row {
+  padding: 8px 10px;
+}
+
+.conversion-progress {
+  margin-top: -8px;
+}
+
+.dependency-details {
+  margin-top: -10px;
+}
+
+.inline-create {
+  padding: 6px 6px 8px;
+}
+"""
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: DOMAIN TYPES AND ERRORS
+# DESCRIPTION: Exceptions, capture backend protocol, immutable data objects,
+#              dependency status, and mutable capture job state.
+# ==============================================================================
+# ==============================================================================
+
+class CaptureError(RuntimeError):
+    pass
+
+
+class PortalCancelled(CaptureError):
+    pass
+
+
+class CaptureBackend(Protocol):
+    name: str
+
+    def capture(self, raw_path: Path) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+@dataclass(frozen=True)
+class ProfilePaths:
+    name: str
+    profile_dir: Path
+    label_file: Path
+    config_file: Path
+    log_file: Path
+    shots_current_dir: Path
+    shots_not_converted_dir: Path
+    shots_converted_dir: Path
+    movies_not_uploaded_dir: Path
+    movies_uploaded_dir: Path
+    deleted_dir: Path
+    thumbnail_dir: Path
+
+    @classmethod
+    def for_name(cls, name: str) -> "ProfilePaths":
+        profile_dir = DATA_DIR / "profiles" / name
+        return cls(
+            name=name,
+            profile_dir=profile_dir,
+            label_file=profile_dir / "working_on.txt",
+            config_file=profile_dir / "config.cfg",
+            log_file=profile_dir / "log.txt",
+            shots_current_dir=profile_dir / "current_shots",
+            shots_not_converted_dir=profile_dir / "shots_archived_not_converted",
+            shots_converted_dir=profile_dir / "shots_archived_converted",
+            movies_not_uploaded_dir=profile_dir / "movies_not_uploaded",
+            movies_uploaded_dir=profile_dir / "movies_uploaded",
+            deleted_dir=profile_dir / ".lapser3-deleted",
+            thumbnail_dir=profile_dir / ".lapser3-thumbnails",
+        )
+
+    def ensure(self) -> None:
+        ensure_base_dirs()
+        for directory in (
+            self.profile_dir,
+            self.shots_current_dir,
+            self.shots_not_converted_dir,
+            self.shots_converted_dir,
+            self.movies_not_uploaded_dir,
+            self.movies_uploaded_dir,
+            self.deleted_dir,
+            self.thumbnail_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        for file_path in (self.label_file, self.log_file, self.config_file):
+            file_path.touch(exist_ok=True)
+
+
+@dataclass(frozen=True)
+class PendingDelete:
+    staged_path: Path
+    original_path: Path
+    profile_name: str
+
+
+@dataclass(frozen=True)
+class ConversionTargets:
+    converted_dir: Path
+    staging_dir: Path
+    movie_path: Path
+    log_path: Path
+    temporary_video: Path
+
+
+@dataclass(frozen=True)
+class DependencyStatus:
+    missing_screen: tuple[str, ...]
+    missing_window: tuple[str, ...]
+    missing_conversion: tuple[str, ...]
+    missing_thumbnail: tuple[str, ...]
+
+    @property
+    def screen_capture_available(self) -> bool:
+        return not self.missing_screen
+
+    @property
+    def window_capture_available(self) -> bool:
+        return not self.missing_window
+
+    @property
+    def conversion_available(self) -> bool:
+        return not self.missing_conversion
+
+    @property
+    def thumbnail_generation_available(self) -> bool:
+        return not self.missing_thumbnail
+
+    @property
+    def has_missing(self) -> bool:
+        return bool(self.missing_tools())
+
+    def missing_tools(self) -> list[str]:
+        missing = (
+            *self.missing_screen,
+            *self.missing_window,
+            *self.missing_conversion,
+            *self.missing_thumbnail,
+        )
+        return sorted(dict.fromkeys(missing))
+
+    def disabled_features(self) -> list[str]:
+        features = []
+        if not self.screen_capture_available:
+            features.append("screen capture")
+        if not self.window_capture_available:
+            features.append("window capture")
+        if not self.conversion_available:
+            features.append("video conversion")
+        if not self.thumbnail_generation_available:
+            features.append("thumbnail previews")
+        return features
+
+    def install_targets_for(self, missing: Sequence[str]) -> list[str]:
+        install = []
+        for item in missing:
+            if item.startswith("gstreamer "):
+                install.append(f"{item} plugin")
+            else:
+                install.append(INSTALL_TARGETS.get(item, item))
+        return sorted(dict.fromkeys(install))
+
+    def install_targets(self) -> list[str]:
+        return self.install_targets_for(self.missing_tools())
+
+    def summary(self) -> str:
+        if not self.has_missing:
+            return ""
+        return (
+            f"Missing: {', '.join(self.missing_tools())}. "
+            f"Install: {', '.join(self.install_targets())}. "
+            f"Disabled: {', '.join(self.disabled_features())}."
+        )
+
+
+@dataclass
+class CaptureJob:
+    profile_name: str
+    paths: ProfilePaths
+    mode: str
+    backend: CaptureBackend
+    label: str
+    started_at: float
+    last_capture_at: float
+    timer_id: int | None = None
+    busy: bool = False
+    shots_taken: int = 0
+
+    def seconds_until_next(self) -> int:
+        elapsed = time.monotonic() - self.last_capture_at
+        return max(int(CAPTURE_INTERVAL_SECONDS - elapsed), 0)
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: DISPLAY AND NAMING HELPERS
+# DESCRIPTION: Locale-aware dates, Lapser filename display, converted-set names,
+#              thumbnail context keys, and simple value normalization helpers.
+# ==============================================================================
+# ==============================================================================
+
+
+def timestamp() -> str:
+    return datetime.now().strftime(LAPSER_TIMESTAMP_FORMAT)
+
+
+def parse_lapser_timestamp(raw: str) -> datetime | None:
+    try:
+        return datetime.strptime(raw, LAPSER_TIMESTAMP_FORMAT)
+    except ValueError:
+        return None
+
+
+def locale_datetime(raw: str) -> str:
+    parsed = parse_lapser_timestamp(raw)
+    if parsed is None:
+        return raw
+    return " ".join(parsed.strftime("%c").split())
+
+
+def display_timestamp(raw: str) -> str:
+    return locale_datetime(raw)
+
+
+def converted_set_range(name: str) -> str:
+    if CONVERTED_SET_SEPARATOR not in name:
+        return display_timestamp(name)
+
+    start, end = name.split(CONVERTED_SET_SEPARATOR, 1)
+    return f"{display_timestamp(start)} to {display_timestamp(end)}"
+
+
+def strip_known_media_suffix(name: str) -> str:
+    suffix = Path(name).suffix.lower()
+    if suffix in MEDIA_SUFFIXES:
+        return name[: -len(suffix)]
+    return name
+
+
+def display_lapser_name(name: str) -> str:
+    stem = strip_known_media_suffix(name)
+    if CONVERTED_SET_SEPARATOR in stem:
+        return converted_set_range(stem)
+    if parse_lapser_timestamp(stem) is not None:
+        return display_timestamp(stem)
+    if CONVERTED_SET_SEPARATOR in name:
+        displayed = converted_set_range(name)
+        if displayed != name:
+            return displayed
+    return name
+
+
+def converted_context_key(profile_name: str, set_name: str) -> str:
+    return f"{profile_name}:converted:{set_name}"
+
+
+def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return min(max(value, lower), upper)
+
+
+def converted_set_name_for(shots: list[Path]) -> str | None:
+    if not shots:
+        return None
+    return f"{shots[0].stem}{CONVERTED_SET_SEPARATOR}{shots[-1].stem}"
+
+
+def has_enough_shots_to_convert(shots: list[Path]) -> bool:
+    return len(shots) >= MIN_SHOTS_TO_CONVERT
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: PROFILE, FILE, AND MEDIA HELPERS
+# DESCRIPTION: Profile directory setup, text/log files, screenshot/video
+#              discovery, thumbnail cache management, media signatures, and
+#              lifecycle file moves.
+# ==============================================================================
+# ==============================================================================
+
+
+def ensure_base_dirs() -> None:
+    (DATA_DIR / "profiles" / DEFAULT_PROFILE_NAME).mkdir(parents=True, exist_ok=True)
+
+
+def valid_profile_name(name: str) -> bool:
+    return bool(name.strip()) and name not in {".", ".."} and "/" not in name
+
+
+def read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").rstrip("\n")
+    except FileNotFoundError:
+        return ""
+
+
+def write_text_file(path: Path, value: str) -> None:
+    path.write_text(f"{value}\n", encoding="utf-8")
+
+
+def temp_lapser_path(kind: str, suffix: str) -> Path:
+    return Path(tempfile.gettempdir()) / f"lapser3-{kind}.{os.getpid()}.{uuid.uuid4().hex}{suffix}"
+
+
+def converted_set_dir(paths: ProfilePaths, set_name: str) -> Path:
+    return paths.shots_converted_dir / set_name
+
+
+def pending_movie_path(paths: ProfilePaths, set_name: str) -> Path:
+    return paths.movies_not_uploaded_dir / f"{set_name}{VIDEO_SUFFIX}"
+
+
+def uploaded_movie_path(paths: ProfilePaths, set_name: str) -> Path:
+    return paths.movies_uploaded_dir / f"{set_name}{VIDEO_SUFFIX}"
+
+
+def conversion_targets(paths: ProfilePaths, set_name: str) -> ConversionTargets:
+    return ConversionTargets(
+        converted_dir=converted_set_dir(paths, set_name),
+        staging_dir=paths.shots_converted_dir / f".{set_name}.tmp-{uuid.uuid4().hex}",
+        movie_path=pending_movie_path(paths, set_name),
+        log_path=paths.movies_not_uploaded_dir / f"{set_name}{LOG_SUFFIX}",
+        temporary_video=temp_lapser_path("video", VIDEO_SUFFIX),
+    )
+
+
+def append_log(paths: ProfilePaths, action: str, label: str) -> None:
+    with paths.log_file.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"{timestamp()} - {action} {label}\n")
+
+
+def current_shot_files(paths: ProfilePaths) -> list[Path]:
+    if not paths.shots_current_dir.exists():
+        return []
+    return sorted(path for path in paths.shots_current_dir.iterdir() if path.is_file())
+
+
+def shot_cache_key(shot: Path) -> ShotCacheKey | None:
+    try:
+        stat = shot.stat()
+    except FileNotFoundError:
+        return None
+    return (shot.name, stat.st_size, stat.st_mtime_ns)
+
+
+def shot_list_signature(shots: list[Path]) -> MediaSignature:
+    keys = [shot_cache_key(shot) for shot in shots]
+    return tuple(key for key in keys if key is not None)
+
+
+def thumbnail_widget_key(context_key: str, key: ShotCacheKey) -> ThumbnailWidgetKey:
+    return (context_key, key[0], key[1], key[2])
+
+
+def thumbnail_path(paths: ProfilePaths, shot: Path, key: ShotCacheKey) -> Path:
+    name, size, mtime = key
+    return paths.thumbnail_dir / f"{Path(name).stem}-{size}-{mtime}{JPG_SUFFIX}"
+
+
+def create_thumbnail(paths: ProfilePaths, shot: Path, key: ShotCacheKey) -> Path | None:
+    if shot_cache_key(shot) != key:
+        return None
+
+    target = thumbnail_path(paths, shot, key)
+    if target.exists():
+        return target
+
+    paths.thumbnail_dir.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(TEMP_JPG_SUFFIX)
+    try:
+        result = subprocess.run(
+            [
+                COMMAND_IMAGEMAGICK_CONVERT,
+                str(shot),
+                "-auto-orient",
+                "-thumbnail",
+                f"{THUMB_WIDTH}x{THUMB_HEIGHT}^",
+                "-gravity",
+                "center",
+                "-extent",
+                f"{THUMB_WIDTH}x{THUMB_HEIGHT}",
+                "-quality",
+                THUMBNAIL_QUALITY,
+                str(temporary),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise CaptureError(f"Could not run {COMMAND_IMAGEMAGICK_CONVERT}: {error}") from error
+    if result.returncode != 0:
+        temporary.unlink(missing_ok=True)
+        raise CaptureError(result.stderr.strip() or "Thumbnail creation failed")
+
+    temporary.replace(target)
+    return target
+
+
+def remove_thumbnail_cache(paths: ProfilePaths, shot: Path) -> None:
+    if not paths.thumbnail_dir.exists():
+        return
+
+    for cached in paths.thumbnail_dir.glob(f"{shot.stem}-*{JPG_SUFFIX}"):
+        try:
+            cached.unlink()
+        except OSError:
+            pass
+
+
+def converted_dirs(paths: ProfilePaths) -> list[Path]:
+    if not paths.shots_converted_dir.exists():
+        return []
+    return sorted(path for path in paths.shots_converted_dir.iterdir() if path.is_dir())
+
+
+def video_files(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    return sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() == VIDEO_SUFFIX
+    )
+
+
+def jpg_files(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    return sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() == JPG_SUFFIX
+    )
+
+
+def video_log_path(video_path: Path) -> Path:
+    return video_path.with_suffix(LOG_SUFFIX)
+
+
+def move_video_pair(
+    source_dir: Path,
+    destination_dir: Path,
+    video_name: str,
+    missing_message: str = "Video is missing.",
+    exists_message: str = "Destination video already exists.",
+    log_exists_message: str = "Destination log already exists.",
+) -> None:
+    source = source_dir / video_name
+    destination = destination_dir / video_name
+    source_log = video_log_path(source)
+    destination_log = video_log_path(destination)
+
+    if not source.exists():
+        raise CaptureError(missing_message)
+    if destination.exists():
+        raise CaptureError(exists_message)
+    if source_log.exists() and destination_log.exists():
+        raise CaptureError(log_exists_message)
+
+    try:
+        shutil.move(str(source), str(destination))
+        if source_log.exists():
+            shutil.move(str(source_log), str(destination_log))
+    except OSError as error:
+        raise CaptureError(str(error)) from error
+
+
+def file_signature(files: list[Path]) -> MediaSignature:
+    keys = []
+    for file_path in files:
+        try:
+            stat = file_path.stat()
+        except FileNotFoundError:
+            continue
+        keys.append((file_path.name, stat.st_size, stat.st_mtime_ns))
+    return tuple(keys)
+
+
+def ffmpeg_error_summary(lines: list[str]) -> str:
+    progress_prefixes = (
+        "bitrate=",
+        "drop_frames=",
+        "dup_frames=",
+        "fps=",
+        "frame=",
+        "out_time",
+        "progress=",
+        "speed=",
+        "stream_",
+        "total_size=",
+    )
+    for line in reversed(lines):
+        if not line or line.startswith(progress_prefixes):
+            continue
+        return line[:180]
+    return "ffmpeg failed"
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: DEPENDENCY CHECKS
+# DESCRIPTION: Startup checks for external commands, GStreamer elements, DBus
+#              support, and the command-line dependency report.
+# ==============================================================================
+# ==============================================================================
+
+
+def command_exists(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def check_dependencies() -> DependencyStatus:
+    Gst.init(None)
+
+    missing_thumbnail = (
+        [] if command_exists(COMMAND_IMAGEMAGICK_CONVERT)
+        else [DEPENDENCY_IMAGEMAGICK_CONVERT]
+    )
+    missing_screen = []
+    for command in (COMMAND_GNOME_SCREENSHOT, COMMAND_GSETTINGS):
+        if not command_exists(command):
+            missing_screen.append(command)
+    missing_screen.extend(missing_thumbnail)
+
+    missing_conversion = [] if command_exists(COMMAND_FFMPEG) else [COMMAND_FFMPEG]
+    missing_window = []
+    missing_window.extend(missing_thumbnail)
+    if dbus is None:
+        missing_window.append(DEPENDENCY_PYTHON_DBUS)
+    for element_name in GSTREAMER_SNAPSHOT_ELEMENTS:
+        if Gst.ElementFactory.find(element_name) is None:
+            missing_window.append(f"gstreamer {element_name}")
+
+    return DependencyStatus(
+        missing_screen=tuple(missing_screen),
+        missing_window=tuple(missing_window),
+        missing_conversion=tuple(missing_conversion),
+        missing_thumbnail=tuple(missing_thumbnail),
+    )
+
+
+def run_check_deps() -> int:
+    dependencies = check_dependencies()
+    checks = (
+        ("Screen capture", dependencies.missing_screen),
+        ("Selected-window capture", dependencies.missing_window),
+        ("Video conversion", dependencies.missing_conversion),
+        ("Thumbnail generation", dependencies.missing_thumbnail),
+    )
+    for label, missing in checks:
+        if missing:
+            print(f"{label} is missing:")
+            for item in missing:
+                print(f"  {item}")
+        else:
+            print(f"{label}: ok")
+
+    if dependencies.has_missing:
+        print()
+        print("Install the missing dependencies to enable the disabled features.")
+        for item in dependencies.install_targets():
+            print(f"  {item}")
+
+    return 1 if dependencies.has_missing else 0
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: GTK WIDGET HELPERS
+# DESCRIPTION: Small reusable widget factories and container utilities used by
+#              the main window without carrying application state.
+# ==============================================================================
+# ==============================================================================
+
+
+def clear_container(container: Gtk.Widget) -> None:
+    child = container.get_first_child()
+    while child is not None:
+        next_child = child.get_next_sibling()
+        if isinstance(container, Gtk.ListBox):
+            container.remove(child)
+        elif isinstance(container, Gtk.FlowBox):
+            container.remove(child)
+        elif isinstance(container, Gtk.Box):
+            container.remove(child)
+        else:
+            child.unparent()
+        child = next_child
+
+
+def icon_button(icon_name: str, tooltip: str, css_class: str | None = None) -> Gtk.Button:
+    button = Gtk.Button.new_from_icon_name(icon_name)
+    button.set_tooltip_text(tooltip)
+    if css_class:
+        button.add_css_class(css_class)
+    return button
+
+
+def labeled_button(
+    icon_name: str,
+    label: str,
+    tooltip: str,
+    css_class: str | None = None,
+) -> Gtk.Button:
+    button = Gtk.Button()
+    content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    image = Gtk.Image.new_from_icon_name(icon_name)
+    text = Gtk.Label(label=label)
+    content.append(image)
+    content.append(text)
+    button.set_child(content)
+    button.set_tooltip_text(tooltip)
+    if css_class:
+        button.add_css_class(css_class)
+    return button
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: CAPTURE BACKENDS
+# DESCRIPTION: Full-screen capture, portal-selected window capture, and
+#              PipeWire/GStreamer snapshot handling.
+# ==============================================================================
+# ==============================================================================
+
+
+class FullScreenCapture:
+    name = "Screen"
+
+    def capture(self, raw_path: Path) -> None:
+        previous_animation_setting = self._get_animation_setting()
+        self._set_animation_setting("false")
+        try:
+            try:
+                result = subprocess.run(
+                    [COMMAND_GNOME_SCREENSHOT, "-f", str(raw_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            except OSError as error:
+                raise CaptureError(
+                    f"Could not run {COMMAND_GNOME_SCREENSHOT}: {error}"
+                ) from error
+            if result.returncode != 0:
+                raise CaptureError(
+                    result.stderr.strip()
+                    or f"{COMMAND_GNOME_SCREENSHOT} failed"
+                )
+        finally:
+            if previous_animation_setting in {"true", "false"}:
+                self._set_animation_setting(previous_animation_setting)
+
+        if not raw_path.exists() or raw_path.stat().st_size == 0:
+            raise CaptureError("gnome-screenshot did not create a screenshot")
+
+    def close(self) -> None:
+        return None
+
+    @staticmethod
+    def _get_animation_setting() -> str | None:
+        try:
+            result = subprocess.run(
+                [
+                    COMMAND_GSETTINGS,
+                    "get",
+                    GSETTINGS_INTERFACE_SCHEMA,
+                    GSETTINGS_ENABLE_ANIMATIONS_KEY,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    @staticmethod
+    def _set_animation_setting(value: str) -> None:
+        try:
+            subprocess.run(
+                [
+                    COMMAND_GSETTINGS,
+                    "set",
+                    GSETTINGS_INTERFACE_SCHEMA,
+                    GSETTINGS_ENABLE_ANIMATIONS_KEY,
+                    value,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
+
+
+class PortalScreenCastSession:
+    SOURCE_WINDOW = 2
+    CURSOR_HIDDEN = 1
+
+    def __init__(self) -> None:
+        if dbus is None:
+            raise CaptureError("python3-dbus is not available")
+
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        self.bus = dbus.SessionBus()
+        self.portal = self.bus.get_object(PORTAL_BUS_NAME, PORTAL_OBJECT_PATH)
+        self.screencast = dbus.Interface(self.portal, SCREENCAST_IFACE)
+        self.properties = dbus.Interface(self.portal, "org.freedesktop.DBus.Properties")
+        self.session_handle: str | None = None
+        self.pipewire_fd: int | None = None
+        self.node_id: int | None = None
+        self.pipewire_serial: int | None = None
+
+    def start_window_selection(self) -> None:
+        available_sources = int(self.properties.Get(SCREENCAST_IFACE, "AvailableSourceTypes"))
+        if not available_sources & self.SOURCE_WINDOW:
+            raise CaptureError("The desktop portal does not advertise window capture")
+
+        session_token = self._token("session")
+        create_result = self._request(
+            "CreateSession",
+            (),
+            {"session_handle_token": dbus.String(session_token)},
+        )
+        self.session_handle = str(create_result["session_handle"])
+
+        self._request(
+            "SelectSources",
+            (dbus.ObjectPath(self.session_handle),),
+            {
+                "types": dbus.UInt32(self.SOURCE_WINDOW),
+                "multiple": dbus.Boolean(False),
+                "cursor_mode": dbus.UInt32(self.CURSOR_HIDDEN),
+            },
+        )
+
+        start_result = self._request("Start", (dbus.ObjectPath(self.session_handle), ""), {})
+        streams = start_result.get("streams")
+        if not streams:
+            raise CaptureError("The portal did not return a PipeWire stream")
+
+        stream = streams[0]
+        self.node_id = int(stream[0])
+        properties = {str(key): value for key, value in dict(stream[1]).items()}
+        if "pipewire-serial" in properties:
+            self.pipewire_serial = int(properties["pipewire-serial"])
+
+        fd = self.screencast.OpenPipeWireRemote(
+            dbus.ObjectPath(self.session_handle),
+            dbus.Dictionary({}, signature="sv"),
+        )
+        self.pipewire_fd = fd.take() if hasattr(fd, "take") else int(fd)
+
+    def capture(self, raw_path: Path) -> None:
+        if self.pipewire_fd is None or self.node_id is None:
+            raise CaptureError("PipeWire stream is not open")
+
+        raw_path.unlink(missing_ok=True)
+        duplicated_fd = os.dup(self.pipewire_fd)
+        pipeline = Gst.Pipeline.new("lapser3-window-snapshot")
+
+        elements = {
+            "source": Gst.ElementFactory.make("pipewiresrc", "source"),
+            "queue": Gst.ElementFactory.make("queue", "queue"),
+            "converter": Gst.ElementFactory.make("videoconvert", "converter"),
+            "caps": Gst.ElementFactory.make("capsfilter", "caps"),
+            "encoder": Gst.ElementFactory.make("jpegenc", "encoder"),
+            "sink": Gst.ElementFactory.make("filesink", "sink"),
+        }
+        missing = [name for name, element in elements.items() if element is None]
+        if missing:
+            self._close_fd(duplicated_fd)
+            raise CaptureError(f"Missing GStreamer elements: {', '.join(missing)}")
+
+        source = elements["source"]
+        source.set_property("fd", duplicated_fd)
+        source.set_property("client-name", "lapser3")
+        source.set_property("num-buffers", 1)
+        source.set_property("do-timestamp", True)
+        source.set_property("resend-last", True)
+        source.set_property("keepalive-time", 1000)
+        if self.pipewire_serial is not None:
+            source.set_property("target-object", str(self.pipewire_serial))
+        else:
+            source.set_property("path", str(self.node_id))
+
+        elements["caps"].set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
+        elements["encoder"].set_property("snapshot", True)
+        elements["encoder"].set_property("quality", WINDOW_SNAPSHOT_JPEG_QUALITY)
+        elements["sink"].set_property("location", str(raw_path))
+        elements["sink"].set_property("sync", False)
+        elements["sink"].set_property("async", False)
+
+        for element in elements.values():
+            pipeline.add(element)
+
+        ordered = list(elements.values())
+        for left, right in zip(ordered, ordered[1:]):
+            if not left.link(right):
+                pipeline.set_state(Gst.State.NULL)
+                self._close_fd(duplicated_fd)
+                raise CaptureError("Could not link the GStreamer snapshot pipeline")
+
+        bus = pipeline.get_bus()
+        try:
+            state_change = pipeline.set_state(Gst.State.PLAYING)
+            if state_change == Gst.StateChangeReturn.FAILURE:
+                raise CaptureError("Could not start the GStreamer snapshot pipeline")
+
+            message = bus.timed_pop_filtered(
+                GST_CAPTURE_TIMEOUT,
+                Gst.MessageType.ERROR | Gst.MessageType.EOS,
+            )
+            if message is None:
+                raise CaptureError("Timed out waiting for a PipeWire frame")
+            if message.type == Gst.MessageType.ERROR:
+                error, debug = message.parse_error()
+                detail = error.message
+                if debug:
+                    detail = f"{detail} ({debug})"
+                raise CaptureError(detail)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+            self._close_fd(duplicated_fd)
+
+        if not raw_path.exists() or raw_path.stat().st_size == 0:
+            raise CaptureError("GStreamer did not create a screenshot")
+
+    def close(self) -> None:
+        if self.pipewire_fd is not None:
+            self._close_fd(self.pipewire_fd)
+            self.pipewire_fd = None
+
+        if self.session_handle is not None:
+            try:
+                session = self.bus.get_object(PORTAL_BUS_NAME, self.session_handle)
+                dbus.Interface(session, SESSION_IFACE).Close()
+            except Exception:
+                pass
+            self.session_handle = None
+
+    def _request(
+        self,
+        method_name: str,
+        args: tuple[Any, ...],
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        token = self._token(method_name.lower())
+        request_path = self._request_path(token)
+        loop = GLib.MainLoop()
+        response_data: dict[str, Any] = {}
+
+        def on_response(response: int, results: dict[str, Any]) -> None:
+            response_data["response"] = int(response)
+            response_data["results"] = results
+            loop.quit()
+
+        receiver_path = request_path
+        self.bus.add_signal_receiver(
+            on_response,
+            signal_name="Response",
+            dbus_interface=REQUEST_IFACE,
+            path=receiver_path,
+        )
+
+        call_options = dict(options)
+        call_options["handle_token"] = dbus.String(token)
+        method = getattr(self.screencast, method_name)
+        handle = method(*args, dbus.Dictionary(call_options, signature="sv"))
+        returned_path = str(handle)
+
+        if returned_path != request_path:
+            self.bus.remove_signal_receiver(
+                on_response,
+                signal_name="Response",
+                dbus_interface=REQUEST_IFACE,
+                path=receiver_path,
+            )
+            receiver_path = returned_path
+            self.bus.add_signal_receiver(
+                on_response,
+                signal_name="Response",
+                dbus_interface=REQUEST_IFACE,
+                path=receiver_path,
+            )
+
+        timed_out = False
+
+        def on_timeout() -> bool:
+            nonlocal timed_out
+            timed_out = True
+            response_data["response"] = 2
+            response_data["results"] = {}
+            loop.quit()
+            return False
+
+        timeout_id = GLib.timeout_add_seconds(PORTAL_REQUEST_TIMEOUT_SECONDS, on_timeout)
+        loop.run()
+        if not timed_out:
+            GLib.source_remove(timeout_id)
+        self.bus.remove_signal_receiver(
+            on_response,
+            signal_name="Response",
+            dbus_interface=REQUEST_IFACE,
+            path=receiver_path,
+        )
+
+        response = response_data.get("response", 2)
+        if response == 1:
+            raise PortalCancelled("The portal request was cancelled")
+        if response != 0:
+            raise CaptureError("The portal request failed")
+        return response_data.get("results", {})
+
+    def _request_path(self, token: str) -> str:
+        sender = self.bus.get_unique_name().lstrip(":").replace(".", "_")
+        return f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+
+    @staticmethod
+    def _token(prefix: str) -> str:
+        return f"lapser3_{prefix}_{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _close_fd(fd: int) -> None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+class PortalWindowCapture:
+    name = "Window"
+
+    def __init__(self) -> None:
+        self.session = PortalScreenCastSession()
+        self.session.start_window_selection()
+
+    def capture(self, raw_path: Path) -> None:
+        self.session.capture(raw_path)
+
+    def close(self) -> None:
+        self.session.close()
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: MAIN WINDOW
+# DESCRIPTION: The libadwaita application window, profile sidebar, lifecycle
+#              tabs, filesystem access and drag export, thumbnail grid, video
+#              playback, capture loop, deletion, conversion, and upload state
+#              transitions.
+# ==============================================================================
+# ==============================================================================
+
+
+class Lapser3Window(Adw.ApplicationWindow):
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: WINDOW BOOTSTRAP AND UI CONSTRUCTION
+    # Description: Initialize window state, build the sidebar and content area,
+    #              install actions, and construct lifecycle tab pages.
+    # ==========================================================================
+
+    def __init__(self, app: Adw.Application, dependencies: DependencyStatus) -> None:
+        super().__init__(application=app)
+        self.set_title("Lapser 3")
+        self.set_default_size(1180, 780)
+        self.set_size_request(860, 560)
+
+        self.dependencies = dependencies
+        self.selected_profile: str | None = None
+        self.selected_shot: Path | None = None
+        self.jobs: dict[str, CaptureJob] = {}
+        self.profile_rows: dict[str, Gtk.ListBoxRow] = {}
+        self.pending_deletes: dict[str, PendingDelete] = {}
+        self.converting_profiles: set[str] = set()
+        self.conversion_progress: dict[str, float] = {}
+        self.conversion_processes: dict[str, subprocess.Popen[str]] = {}
+        self.cancelled_conversions: set[str] = set()
+        self.thumbnail_limits: dict[str, int] = {}
+        self.thumbnail_signatures: dict[str, ThumbnailSignature] = {}
+        self.converted_signatures: dict[str, MediaSignature] = {}
+        self.pending_video_signatures: dict[str, MediaSignature] = {}
+        self.uploaded_video_signatures: dict[str, MediaSignature] = {}
+        self.thumbnail_pictures: dict[ThumbnailWidgetKey, Gtk.Picture] = {}
+        self.thumbnail_jobs: set[ThumbnailWidgetKey] = set()
+        self.thumbnail_queue: queue.Queue[ThumbnailQueueItem] = queue.Queue()
+        self.thumbnail_worker_started = False
+        self.suppress_profile_refresh = False
+        self.current_converted_set: Path | None = None
+        self.loading_more_keys: set[str] = set()
+        self.video_windows: list[Adw.Window] = []
+
+        self.undo_action = Gio.SimpleAction.new("undo-delete", GLib.VariantType.new("s"))
+        self.undo_action.connect("activate", self.on_undo_delete)
+        self.add_action(self.undo_action)
+
+        self.build_ui()
+        self.update_dependency_banner()
+        self.load_profiles()
+        self.suppress_profile_refresh = True
+        self.select_first_profile()
+        self.suppress_profile_refresh = False
+        if self.selected_profile is not None:
+            GLib.idle_add(self.refresh_profile_view, True)
+        if self.dependencies.has_missing:
+            GLib.idle_add(self.show_dependency_toast)
+        self.status_timer_id = GLib.timeout_add_seconds(1, self.refresh_running_status)
+
+    def build_ui(self) -> None:
+        self.toast_overlay = Adw.ToastOverlay()
+        toolbar = Adw.ToolbarView()
+        self.toast_overlay.set_child(toolbar)
+        self.set_content(self.toast_overlay)
+
+        header = Adw.HeaderBar()
+        title = Adw.WindowTitle(title="Lapser 3", subtitle="Timelapse capture")
+        header.set_title_widget(title)
+        toolbar.add_top_bar(header)
+
+        refresh_button = icon_button("view-refresh-symbolic", "Refresh profiles and screenshots")
+        refresh_button.connect("clicked", lambda _button: self.refresh_all())
+        header.pack_end(refresh_button)
+
+        key_controller = Gtk.EventControllerKey.new()
+        key_controller.connect("key-pressed", self.on_key_pressed)
+        self.add_controller(key_controller)
+
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        toolbar.set_content(self.main_box)
+
+        self.sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.sidebar.add_css_class("sidebar-pane")
+        self.sidebar.set_hexpand(False)
+        self.sidebar.set_hexpand_set(True)
+        self.sidebar.set_halign(Gtk.Align.START)
+        self.sidebar.set_size_request(SIDEBAR_MIN_WIDTH, -1)
+        self.main_box.append(self.sidebar)
+
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.content.set_margin_top(20)
+        self.content.set_margin_bottom(20)
+        self.content.set_margin_start(22)
+        self.content.set_margin_end(22)
+        self.content.set_hexpand(True)
+        self.content.set_hexpand_set(True)
+        self.content.set_vexpand(True)
+        self.main_box.append(self.content)
+
+        self.build_sidebar()
+        self.build_profile_view()
+
+    def build_sidebar(self) -> None:
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        top.set_margin_top(12)
+        top.set_margin_bottom(4)
+        top.set_margin_start(8)
+        top.set_margin_end(6)
+        self.sidebar.append(top)
+
+        label = Gtk.Label(label="Profiles")
+        label.add_css_class("sidebar-title")
+        label.set_halign(Gtk.Align.START)
+        label.set_hexpand(True)
+        top.append(label)
+
+        self.show_create_button = icon_button("list-add-symbolic", "Create profile")
+        self.show_create_button.connect("clicked", self.on_show_create_profile)
+        top.append(self.show_create_button)
+
+        self.create_revealer = Gtk.Revealer()
+        self.create_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.sidebar.append(self.create_revealer)
+
+        create_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        create_box.add_css_class("inline-create")
+        self.create_revealer.set_child(create_box)
+
+        self.new_profile_entry = Gtk.Entry()
+        self.new_profile_entry.set_placeholder_text("New profile")
+        self.new_profile_entry.set_hexpand(True)
+        self.new_profile_entry.connect("activate", self.on_create_profile)
+        create_box.append(self.new_profile_entry)
+
+        create_button = icon_button("object-select-symbolic", "Create")
+        create_button.add_css_class("suggested-action")
+        create_button.connect("clicked", self.on_create_profile)
+        create_box.append(create_button)
+
+        cancel_button = icon_button("window-close-symbolic", "Cancel")
+        cancel_button.connect("clicked", self.on_cancel_create_profile)
+        create_box.append(cancel_button)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+        self.sidebar.append(scroller)
+
+        self.profile_list = Gtk.ListBox()
+        self.profile_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.profile_list.connect("row-selected", self.on_profile_selected)
+        scroller.set_child(self.profile_list)
+
+    def build_profile_view(self) -> None:
+        self.dependency_banner = Adw.Banner()
+        self.dependency_banner.set_revealed(False)
+        self.content.append(self.dependency_banner)
+
+        self.dependency_details = Gtk.Label(label="")
+        self.dependency_details.add_css_class("muted")
+        self.dependency_details.add_css_class("dependency-details")
+        self.dependency_details.set_halign(Gtk.Align.START)
+        self.dependency_details.set_wrap(True)
+        self.dependency_details.set_visible(False)
+        self.content.append(self.dependency_details)
+
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.content.append(header_row)
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title_box.set_hexpand(True)
+        header_row.append(title_box)
+
+        self.profile_title = Gtk.Label(label="")
+        self.profile_title.add_css_class("profile-heading")
+        self.profile_title.set_halign(Gtk.Align.START)
+        self.profile_title.set_ellipsize(3)
+        title_box.append(self.profile_title)
+
+        self.profile_subtitle = Gtk.Label(label="")
+        self.profile_subtitle.add_css_class("muted")
+        self.profile_subtitle.set_halign(Gtk.Align.START)
+        title_box.append(self.profile_subtitle)
+
+        self.status_pill = Gtk.Label(label="Idle")
+        self.status_pill.add_css_class("quiet-pill")
+        header_row.append(self.status_pill)
+
+        label_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.content.append(label_row)
+
+        working_label = Gtk.Label(label="Working on")
+        working_label.add_css_class("section-heading")
+        working_label.set_halign(Gtk.Align.START)
+        label_row.append(working_label)
+
+        self.working_entry = Gtk.Entry()
+        self.working_entry.set_placeholder_text("Describe this capture")
+        self.working_entry.set_hexpand(True)
+        self.working_entry.connect("changed", self.on_working_changed)
+        label_row.append(self.working_entry)
+
+        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.content.append(controls)
+
+        self.start_screen_button = labeled_button(
+            "display-symbolic",
+            "Screen",
+            "Start full-screen capture for this profile",
+            "suggested-action",
+        )
+        self.start_screen_button.connect("clicked", lambda _button: self.start_capture("screen"))
+        controls.append(self.start_screen_button)
+
+        self.start_window_button = labeled_button(
+            "window-new-symbolic",
+            "Window",
+            "Start selected-window capture for this profile",
+        )
+        self.start_window_button.connect("clicked", lambda _button: self.start_capture("window"))
+        controls.append(self.start_window_button)
+
+        self.stop_button = labeled_button(
+            "media-playback-stop-symbolic",
+            "Stop",
+            "Stop capture for this profile",
+            "destructive-action",
+        )
+        self.stop_button.connect("clicked", lambda _button: self.stop_selected_job())
+        controls.append(self.stop_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        controls.append(spacer)
+
+        self.convert_current_button = labeled_button(
+            "video-x-generic-symbolic",
+            "Convert",
+            "Create a movie from current screenshots",
+        )
+        self.convert_current_button.connect("clicked", lambda _button: self.convert_current())
+        controls.append(self.convert_current_button)
+
+        self.conversion_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.conversion_box.add_css_class("conversion-progress")
+        self.conversion_box.set_visible(False)
+        self.content.append(self.conversion_box)
+
+        self.conversion_label = Gtk.Label(label="Converting video")
+        self.conversion_label.add_css_class("section-heading")
+        self.conversion_label.set_halign(Gtk.Align.START)
+        self.conversion_box.append(self.conversion_label)
+
+        self.conversion_progress_bar = Gtk.ProgressBar()
+        self.conversion_progress_bar.set_hexpand(True)
+        self.conversion_progress_bar.set_show_text(True)
+        self.conversion_box.append(self.conversion_progress_bar)
+
+        self.cancel_conversion_button = icon_button(
+            "window-close-symbolic",
+            "Cancel conversion",
+            "destructive-action",
+        )
+        self.cancel_conversion_button.connect(
+            "clicked",
+            lambda _button: self.cancel_selected_conversion(),
+        )
+        self.conversion_box.append(self.cancel_conversion_button)
+
+        self.lifecycle_switcher = Gtk.StackSwitcher()
+        self.lifecycle_switcher.add_css_class("lifecycle-tabs")
+        self.content.append(self.lifecycle_switcher)
+
+        self.lifecycle_stack = Gtk.Stack()
+        self.lifecycle_stack.set_vexpand(True)
+        self.lifecycle_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.lifecycle_switcher.set_stack(self.lifecycle_stack)
+        self.content.append(self.lifecycle_stack)
+
+        current_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        current_page.set_vexpand(True)
+        self.lifecycle_stack.add_titled(current_page, PAGE_CURRENT, "Current")
+
+        thumbs_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        current_page.append(thumbs_header)
+
+        thumbs_title = Gtk.Label(label="Current Screenshots")
+        thumbs_title.add_css_class("section-heading")
+        thumbs_title.set_halign(Gtk.Align.START)
+        thumbs_title.set_hexpand(True)
+        thumbs_header.append(thumbs_title)
+
+        self.current_folder_button = labeled_button(
+            "folder-open-symbolic",
+            "Folder",
+            "Open current screenshots folder",
+        )
+        self.current_folder_button.connect("clicked", self.open_current_screenshots_folder)
+        thumbs_header.append(self.current_folder_button)
+
+        self.shot_count_label = Gtk.Label(label="")
+        self.shot_count_label.add_css_class("muted")
+        thumbs_header.append(self.shot_count_label)
+
+        self.thumb_scroller = Gtk.ScrolledWindow()
+        self.thumb_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.thumb_scroller.set_vexpand(True)
+        current_page.append(self.thumb_scroller)
+
+        self.thumb_flow = Gtk.FlowBox()
+        self.thumb_flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.thumb_flow.set_max_children_per_line(THUMB_FLOW_MAX_COLUMNS)
+        self.thumb_flow.set_min_children_per_line(THUMB_FLOW_MIN_COLUMNS)
+        self.thumb_flow.connect("child-activated", self.on_thumb_activated)
+        self.thumb_flow.connect("selected-children-changed", self.on_thumb_selection_changed)
+        self.thumb_scroller.set_child(self.thumb_flow)
+
+        converted_page = self.make_list_page("Converted screenshot sets")
+        self.converted_list = converted_page[1]
+        self.converted_list.set_activate_on_single_click(False)
+        self.converted_list.connect("row-activated", self.on_converted_row_activated)
+        self.lifecycle_stack.add_titled(converted_page[0], PAGE_CONVERTED, "Converted")
+
+        converted_detail_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        converted_detail_page.set_vexpand(True)
+        self.lifecycle_stack.add_named(converted_detail_page, PAGE_CONVERTED_DETAIL)
+
+        converted_detail_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        converted_detail_page.append(converted_detail_header)
+
+        back_button = labeled_button(
+            "go-previous-symbolic",
+            "Back",
+            "Return to converted sets",
+        )
+        back_button.connect("clicked", self.on_converted_detail_back)
+        converted_detail_header.append(back_button)
+
+        converted_title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        converted_title_box.set_hexpand(True)
+        converted_detail_header.append(converted_title_box)
+
+        self.converted_detail_title = Gtk.Label(label="Converted screenshots")
+        self.converted_detail_title.add_css_class("section-heading")
+        self.converted_detail_title.set_halign(Gtk.Align.START)
+        self.converted_detail_title.set_ellipsize(3)
+        converted_title_box.append(self.converted_detail_title)
+
+        self.converted_detail_subtitle = Gtk.Label(label="")
+        self.converted_detail_subtitle.add_css_class("muted")
+        self.converted_detail_subtitle.set_halign(Gtk.Align.START)
+        self.converted_detail_subtitle.set_ellipsize(3)
+        converted_title_box.append(self.converted_detail_subtitle)
+
+        self.converted_detail_count = Gtk.Label(label="")
+        self.converted_detail_count.add_css_class("muted")
+        converted_detail_header.append(self.converted_detail_count)
+
+        self.converted_detail_folder_button = labeled_button(
+            "folder-open-symbolic",
+            "Folder",
+            "Open converted screenshot set folder",
+        )
+        self.converted_detail_folder_button.connect(
+            "clicked",
+            self.open_current_converted_set_folder,
+        )
+        converted_detail_header.append(self.converted_detail_folder_button)
+
+        self.converted_detail_scroller = Gtk.ScrolledWindow()
+        self.converted_detail_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        self.converted_detail_scroller.set_vexpand(True)
+        converted_detail_page.append(self.converted_detail_scroller)
+
+        self.converted_detail_flow = Gtk.FlowBox()
+        self.converted_detail_flow.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.converted_detail_flow.set_max_children_per_line(THUMB_FLOW_MAX_COLUMNS)
+        self.converted_detail_flow.set_min_children_per_line(THUMB_FLOW_MIN_COLUMNS)
+        self.converted_detail_scroller.set_child(self.converted_detail_flow)
+
+        pending_page = self.make_list_page("Videos not uploaded")
+        self.pending_video_list = pending_page[1]
+        self.pending_video_list.set_activate_on_single_click(False)
+        self.pending_video_list.connect("row-activated", self.on_video_row_activated)
+        self.lifecycle_stack.add_titled(
+            pending_page[0],
+            PAGE_PENDING_VIDEOS,
+            "Videos Not Uploaded",
+        )
+
+        uploaded_page = self.make_list_page("Uploaded videos")
+        self.uploaded_video_list = uploaded_page[1]
+        self.uploaded_video_list.set_activate_on_single_click(False)
+        self.uploaded_video_list.connect("row-activated", self.on_video_row_activated)
+        self.lifecycle_stack.add_titled(uploaded_page[0], PAGE_UPLOADED_VIDEOS, "Uploaded")
+
+    def make_list_page(self, title_text: str) -> tuple[Gtk.Box, Gtk.ListBox]:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.set_vexpand(True)
+
+        title = Gtk.Label(label=title_text)
+        title.add_css_class("section-heading")
+        title.set_halign(Gtk.Align.START)
+        page.append(title)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+        page.append(scroller)
+
+        list_box = Gtk.ListBox()
+        list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroller.set_child(list_box)
+        return page, list_box
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: DEPENDENCY FEEDBACK
+    # Description: Present missing tool information and disable unavailable
+    #              feature controls without preventing the app from opening.
+    # ==========================================================================
+
+    def update_dependency_banner(self) -> None:
+        if not self.dependencies.has_missing:
+            self.dependency_banner.set_revealed(False)
+            self.dependency_details.set_visible(False)
+            return
+
+        self.dependency_banner.set_title("Some Lapser features are unavailable")
+        self.dependency_details.set_label(self.dependencies.summary())
+        self.dependency_details.set_visible(True)
+        self.dependency_banner.set_revealed(True)
+
+    def show_dependency_toast(self) -> bool:
+        if self.dependencies.has_missing:
+            self.toast(self.dependencies.summary())
+        return False
+
+    def unavailable_tooltip(self, missing: Sequence[str], fallback: str) -> str:
+        if not missing:
+            return fallback
+        return f"Install {', '.join(missing)} to enable this."
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: FILESYSTEM ACCESS AND DRAG EXPORT
+    # Description: Open profile media folders through the desktop handler and
+    #              expose screenshots, converted folders, and videos as file
+    #              drags without changing Lapser-owned files.
+    # ==========================================================================
+
+    def make_open_folder_button(self, path: Path, tooltip: str) -> Gtk.Button:
+        button = labeled_button("folder-open-symbolic", "Folder", tooltip)
+        button.connect("clicked", self.open_folder_for_path, path)
+        return button
+
+    def open_current_screenshots_folder(self, _button: Gtk.Button) -> None:
+        paths = self.selected_paths()
+        if paths is not None:
+            self.open_folder(paths.shots_current_dir)
+
+    def open_current_converted_set_folder(self, _button: Gtk.Button) -> None:
+        if self.current_converted_set is not None:
+            self.open_folder(self.current_converted_set)
+
+    def open_folder_for_path(self, _button: Gtk.Button, path: Path) -> None:
+        self.open_folder(path if path.is_dir() else path.parent)
+
+    def open_folder(self, folder: Path) -> None:
+        if not folder.exists() or not folder.is_dir():
+            self.toast("Folder is missing.")
+            return
+
+        uri = Gio.File.new_for_path(str(folder)).get_uri()
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except GLib.Error as error:
+            self.toast(f"Could not open folder: {error.message}")
+
+    def add_file_drag_source(self, widget: Gtk.Widget, path: Path) -> None:
+        drag_source = Gtk.DragSource()
+        drag_source.set_actions(Gdk.DragAction.COPY)
+        drag_source.connect("prepare", self.on_file_drag_prepare, path)
+        widget.add_controller(drag_source)
+
+    def on_file_drag_prepare(
+        self,
+        _source: Gtk.DragSource,
+        _x: float,
+        _y: float,
+        path: Path,
+    ) -> Gdk.ContentProvider | None:
+        if not path.exists():
+            self.toast("File or folder is missing.")
+            return None
+
+        gfile = Gio.File.new_for_path(str(path))
+        uri_bytes = GLib.Bytes.new(f"{gfile.get_uri()}\r\n".encode("utf-8"))
+        providers = [
+            Gdk.ContentProvider.new_for_value(Gdk.FileList.new_from_list([gfile])),
+            Gdk.ContentProvider.new_for_bytes("text/uri-list", uri_bytes),
+        ]
+        return Gdk.ContentProvider.new_union(providers)
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: PROFILE LIST AND VIEW REFRESH
+    # Description: Load profiles, size the sidebar, maintain selection, compute
+    #              media signatures, and update visible profile state.
+    # ==========================================================================
+
+    def load_profiles(self) -> None:
+        ensure_base_dirs()
+        self.cleanup_old_staged_deletes()
+        clear_container(self.profile_list)
+        self.profile_rows.clear()
+
+        profile_dir = DATA_DIR / "profiles"
+        profiles = sorted(path.name for path in profile_dir.iterdir() if path.is_dir())
+        for profile_name in profiles:
+            paths = ProfilePaths.for_name(profile_name)
+            paths.ensure()
+            row = self.make_profile_row(paths)
+            self.profile_rows[profile_name] = row
+            self.profile_list.append(row)
+        self.resize_sidebar_for_profiles()
+
+    def text_pixel_width(self, text: str, bold: bool = False) -> int:
+        layout = self.create_pango_layout(text)
+        if bold:
+            attributes = Pango.AttrList()
+            attributes.insert(Pango.attr_weight_new(Pango.Weight.BOLD))
+            layout.set_attributes(attributes)
+        width, _height = layout.get_pixel_size()
+        return width
+
+    def resize_sidebar_for_profiles(self) -> None:
+        header_width = self.text_pixel_width("Profiles", bold=True) + SIDEBAR_HEADER_CHROME_WIDTH
+        widest_row = 0
+        for row in self.profile_rows.values():
+            name = getattr(row, "profile_name", "")
+            status = getattr(row, "profile_status", "")
+            widest_row = max(
+                widest_row,
+                self.text_pixel_width(name, bold=True),
+                self.text_pixel_width(status),
+            )
+
+        width = max(SIDEBAR_MIN_WIDTH, header_width, widest_row + SIDEBAR_ROW_CHROME_WIDTH)
+        self.sidebar.set_size_request(width, -1)
+
+    def make_profile_row(self, paths: ProfilePaths) -> Gtk.ListBoxRow:
+        row = Gtk.ListBoxRow()
+        row.profile_name = paths.name
+        row.add_css_class("profile-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.set_child(box)
+
+        icon_name = "media-record-symbolic" if paths.name in self.jobs else "folder-symbolic"
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.set_pixel_size(15)
+        box.append(icon)
+
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        text_box.set_hexpand(True)
+        box.append(text_box)
+
+        title = Gtk.Label(label=paths.name)
+        title.add_css_class("profile-name")
+        title.set_halign(Gtk.Align.START)
+        title.set_ellipsize(3)
+        text_box.append(title)
+
+        shots = len(current_shot_files(paths))
+        converted = len(converted_dirs(paths))
+        videos = len(video_files(paths.movies_not_uploaded_dir))
+        if paths.name in self.converting_profiles:
+            status = "Converting"
+        elif paths.name in self.jobs:
+            status = "Recording"
+        else:
+            status = f"{shots} cur, {converted} sets, {videos} vid"
+        row.profile_status = status
+        subtitle = Gtk.Label(label=status)
+        subtitle.add_css_class("muted")
+        subtitle.set_halign(Gtk.Align.START)
+        subtitle.set_ellipsize(3)
+        text_box.append(subtitle)
+
+        return row
+
+    def select_first_profile(self) -> None:
+        if self.selected_profile and self.selected_profile in self.profile_rows:
+            self.profile_list.select_row(self.profile_rows[self.selected_profile])
+            return
+
+        first = self.profile_list.get_row_at_index(0)
+        if first is not None:
+            self.profile_list.select_row(first)
+
+    def on_profile_selected(self, _list_box: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
+        if row is None:
+            return
+        self.selected_profile = row.profile_name
+        self.selected_shot = None
+        self.current_converted_set = None
+        if self.lifecycle_stack.get_visible_child_name() == PAGE_CONVERTED_DETAIL:
+            self.lifecycle_stack.set_visible_child_name(PAGE_CONVERTED)
+        self.thumbnail_limits.setdefault(row.profile_name, THUMBNAIL_BATCH_SIZE)
+        if self.suppress_profile_refresh:
+            return
+        self.refresh_profile_view(force_media=True)
+
+    def selected_paths(self) -> ProfilePaths | None:
+        if self.selected_profile is None:
+            return None
+        paths = ProfilePaths.for_name(self.selected_profile)
+        paths.ensure()
+        return paths
+
+    def refresh_all(self) -> None:
+        current = self.selected_profile
+        self.load_profiles()
+        if current and current in self.profile_rows:
+            self.selected_profile = current
+            self.profile_list.select_row(self.profile_rows[current])
+        else:
+            self.select_first_profile()
+        self.refresh_profile_view(force_media=True)
+
+    def refresh_profile_rows(self) -> None:
+        current = self.selected_profile
+        self.load_profiles()
+        if current and current in self.profile_rows:
+            self.selected_profile = current
+            self.profile_list.select_row(self.profile_rows[current])
+
+    def invalidate_thumbnail_context(self, context_key: str) -> None:
+        self.thumbnail_signatures.pop(context_key, None)
+
+    def invalidate_current_shots(self, profile_name: str) -> None:
+        self.invalidate_thumbnail_context(profile_name)
+
+    def invalidate_video_lifecycle(self, profile_name: str) -> None:
+        self.converted_signatures.pop(profile_name, None)
+        self.pending_video_signatures.pop(profile_name, None)
+        self.uploaded_video_signatures.pop(profile_name, None)
+
+    def refresh_after_media_change(
+        self,
+        profile_name: str,
+        force_media: bool = True,
+    ) -> None:
+        self.refresh_profile_rows()
+        if self.selected_profile == profile_name:
+            self.refresh_profile_view(force_media=force_media)
+
+    def refresh_profile_view(self, force_media: bool = False) -> None:
+        paths = self.selected_paths()
+        if paths is None:
+            return
+
+        self.profile_title.set_label(paths.name)
+        self.current_folder_button.set_tooltip_text(
+            f"Open current screenshots folder for {paths.name}"
+        )
+        self.working_entry.handler_block_by_func(self.on_working_changed)
+        self.working_entry.set_text(read_text_file(paths.label_file))
+        self.working_entry.handler_unblock_by_func(self.on_working_changed)
+
+        shots = current_shot_files(paths)
+        converted = converted_dirs(paths)
+        pending_videos = video_files(paths.movies_not_uploaded_dir)
+        uploaded_videos = video_files(paths.movies_uploaded_dir)
+        self.refresh_status_controls(paths, len(shots))
+
+        shot_signature = shot_list_signature(shots)
+        thumbnail_limit = self.thumbnail_limits.get(paths.name, THUMBNAIL_BATCH_SIZE)
+        thumbnail_signature = (shot_signature, thumbnail_limit)
+        converted_signature = self.converted_signature(paths, converted)
+        pending_signature = file_signature(pending_videos)
+        uploaded_signature = file_signature(uploaded_videos)
+
+        self.shot_count_label.set_label(f"{len(shots)} shots")
+        if force_media or self.thumbnail_signatures.get(paths.name) != thumbnail_signature:
+            self.thumbnail_signatures[paths.name] = thumbnail_signature
+            self.refresh_thumbnails(paths, shots)
+        if force_media or self.converted_signatures.get(paths.name) != converted_signature:
+            self.converted_signatures[paths.name] = converted_signature
+            self.refresh_converted_sets(paths, converted)
+        if self.lifecycle_stack.get_visible_child_name() == PAGE_CONVERTED_DETAIL:
+            if (
+                self.current_converted_set is None
+                or self.current_converted_set.parent != paths.shots_converted_dir
+                or not self.current_converted_set.exists()
+            ):
+                self.current_converted_set = None
+                self.lifecycle_stack.set_visible_child_name(PAGE_CONVERTED)
+            else:
+                self.refresh_converted_detail(paths, self.current_converted_set)
+        if force_media or self.pending_video_signatures.get(paths.name) != pending_signature:
+            self.pending_video_signatures[paths.name] = pending_signature
+            self.refresh_video_list(paths, pending_videos, uploaded=False)
+        if force_media or self.uploaded_video_signatures.get(paths.name) != uploaded_signature:
+            self.uploaded_video_signatures[paths.name] = uploaded_signature
+            self.refresh_video_list(paths, uploaded_videos, uploaded=True)
+
+    def refresh_status_controls(self, paths: ProfilePaths, shot_count: int) -> None:
+        job = self.jobs.get(paths.name)
+
+        converting = paths.name in self.converting_profiles
+
+        if converting:
+            progress = self.conversion_progress.get(paths.name, 0.0)
+            self.status_pill.set_label("Converting")
+            self.status_pill.remove_css_class("quiet-pill")
+            self.status_pill.add_css_class("status-pill")
+            if paths.name in self.cancelled_conversions:
+                self.profile_subtitle.set_label("Cancelling conversion")
+            else:
+                self.profile_subtitle.set_label(f"Creating movie ({int(progress * 100)}%)")
+        elif job:
+            self.status_pill.set_label(f"Recording {job.mode}")
+            self.status_pill.remove_css_class("quiet-pill")
+            self.status_pill.add_css_class("status-pill")
+            if job.busy:
+                self.profile_subtitle.set_label("Capturing now")
+            else:
+                self.profile_subtitle.set_label(f"Next shot in {job.seconds_until_next()}s")
+        else:
+            self.status_pill.set_label("Idle")
+            self.status_pill.remove_css_class("status-pill")
+            self.status_pill.add_css_class("quiet-pill")
+            self.profile_subtitle.set_label("Ready to capture")
+
+        self.stop_button.set_sensitive(job is not None)
+        self.start_screen_button.set_sensitive(
+            job is None and not converting and self.dependencies.screen_capture_available
+        )
+        self.start_screen_button.set_tooltip_text(
+            self.unavailable_tooltip(
+                self.dependencies.missing_screen,
+                "Start full-screen capture for this profile",
+            )
+        )
+        self.start_window_button.set_sensitive(
+            job is None and not converting and self.dependencies.window_capture_available
+        )
+        self.start_window_button.set_tooltip_text(
+            self.unavailable_tooltip(
+                self.dependencies.missing_window,
+                "Start selected-window capture for this profile",
+            )
+        )
+        self.convert_current_button.set_sensitive(
+            shot_count >= MIN_SHOTS_TO_CONVERT
+            and job is None
+            and not converting
+            and self.dependencies.conversion_available
+        )
+        self.convert_current_button.set_tooltip_text(
+            self.unavailable_tooltip(
+                self.dependencies.missing_conversion,
+                "Create a movie from current screenshots",
+            )
+        )
+        self.refresh_conversion_progress(paths)
+
+    def refresh_conversion_progress(self, paths: ProfilePaths) -> None:
+        if paths.name not in self.converting_profiles:
+            self.conversion_box.set_visible(False)
+            return
+
+        progress = clamp(self.conversion_progress.get(paths.name, 0.0))
+        cancelling = paths.name in self.cancelled_conversions
+        self.conversion_box.set_visible(True)
+        self.conversion_label.set_label("Cancelling..." if cancelling else "Converting video")
+        self.conversion_progress_bar.set_fraction(progress)
+        self.conversion_progress_bar.set_text(f"{int(progress * 100)}%")
+        self.cancel_conversion_button.set_sensitive(not cancelling)
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: THUMBNAIL GRID AND LAZY LOADING
+    # Description: Render current/converted screenshot grids, queue thumbnail
+    #              generation, preserve scroll position, and load older batches.
+    # ==========================================================================
+
+    def converted_signature(self, paths: ProfilePaths, sets: list[Path]) -> MediaSignature:
+        set_keys: list[SignatureEntry] = []
+        for converted_set in sets:
+            try:
+                jpg_count = len(jpg_files(converted_set))
+                set_keys.append((converted_set.name, converted_set.stat().st_mtime_ns, jpg_count))
+            except FileNotFoundError:
+                continue
+        return tuple(set_keys)
+
+    def refresh_thumbnails(self, paths: ProfilePaths, shots: list[Path]) -> None:
+        limit = self.thumbnail_limits.get(paths.name, THUMBNAIL_BATCH_SIZE)
+        self.populate_shot_flow(
+            self.thumb_flow,
+            paths,
+            shots,
+            paths.name,
+            limit,
+            allow_delete=True,
+            load_older_profile=paths.name,
+        )
+
+    def populate_shot_flow(
+        self,
+        flow: Gtk.FlowBox,
+        paths: ProfilePaths,
+        shots: list[Path],
+        context_key: str,
+        limit: int,
+        allow_delete: bool,
+        load_older_profile: str | None = None,
+    ) -> None:
+        clear_container(flow)
+        self.thumbnail_pictures = {
+            key: picture
+            for key, picture in self.thumbnail_pictures.items()
+            if key[0] != context_key
+        }
+
+        if not self.dependencies.thumbnail_generation_available:
+            flow.append(self.make_thumbnails_unavailable_child())
+            return
+
+        newest_first = list(reversed(shots))
+        visible_shots = newest_first[:limit]
+
+        for shot in visible_shots:
+            child = Gtk.FlowBoxChild()
+            child.shot_path = shot
+            child.set_tooltip_text(shot.name)
+            self.add_file_drag_source(child, shot)
+
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            card.add_css_class("thumb-card")
+            card.set_tooltip_text(shot.name)
+            child.set_child(card)
+
+            overlay = Gtk.Overlay()
+            card.append(overlay)
+
+            picture = Gtk.Picture()
+            picture.set_content_fit(Gtk.ContentFit.COVER)
+            picture.set_can_shrink(True)
+            picture.set_size_request(THUMB_WIDTH, THUMB_HEIGHT)
+            overlay.set_child(picture)
+
+            key = shot_cache_key(shot)
+            if key is not None:
+                widget_key = thumbnail_widget_key(context_key, key)
+                self.thumbnail_pictures[widget_key] = picture
+                cached = thumbnail_path(paths, shot, key)
+                if cached.exists():
+                    picture.set_filename(str(cached))
+                else:
+                    self.queue_thumbnail(paths, shot, key, context_key)
+
+            if allow_delete:
+                delete_button = icon_button(
+                    "user-trash-symbolic",
+                    f"Remove {shot.name}",
+                    "thumb-delete",
+                )
+                delete_button.add_css_class("circular")
+                delete_button.add_css_class("destructive-action")
+                delete_button.set_halign(Gtk.Align.END)
+                delete_button.set_valign(Gtk.Align.START)
+                delete_button.connect("clicked", self.on_delete_clicked, paths.name, shot)
+                overlay.add_overlay(delete_button)
+
+            label = Gtk.Label(label=display_lapser_name(shot.name))
+            label.add_css_class("muted")
+            label.set_tooltip_text(shot.name)
+            label.set_max_width_chars(20)
+            label.set_ellipsize(3)
+            card.append(label)
+
+            flow.append(child)
+
+        hidden_count = len(shots) - len(visible_shots)
+        if hidden_count > 0 and load_older_profile is not None:
+            flow.append(self.make_load_older_child(load_older_profile, hidden_count))
+
+    def make_thumbnails_unavailable_child(self) -> Gtk.FlowBoxChild:
+        child = Gtk.FlowBoxChild()
+        child.shot_path = None
+        child.set_can_focus(False)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.add_css_class("thumb-card")
+        card.set_size_request(THUMB_WIDTH * 2, THUMB_HEIGHT)
+        child.set_child(card)
+
+        title = Gtk.Label(label="Thumbnail previews unavailable")
+        title.add_css_class("section-heading")
+        title.set_halign(Gtk.Align.START)
+        card.append(title)
+
+        install = ", ".join(
+            self.dependencies.install_targets_for(self.dependencies.missing_thumbnail)
+        )
+        detail = Gtk.Label(label=f"Install {install}.")
+        detail.add_css_class("muted")
+        detail.set_halign(Gtk.Align.START)
+        detail.set_wrap(True)
+        card.append(detail)
+        return child
+
+    def make_load_older_child(self, limit_key: str, hidden_count: int) -> Gtk.FlowBoxChild:
+        child = Gtk.FlowBoxChild()
+        child.shot_path = None
+        child.load_older_key = limit_key
+        child.set_can_focus(False)
+
+        button = Gtk.Button()
+        button.add_css_class("flat")
+        button.add_css_class("thumb-card")
+        button.set_tooltip_text("Show older screenshots")
+        button.set_size_request(THUMB_WIDTH, THUMB_HEIGHT)
+        button.connect("clicked", self.on_load_older_clicked, limit_key, hidden_count)
+        child.set_child(button)
+
+        self.set_load_older_button_content(
+            button,
+            hidden_count,
+            loading=limit_key in self.loading_more_keys,
+        )
+        return child
+
+    def set_load_older_button_content(
+        self,
+        button: Gtk.Button,
+        hidden_count: int,
+        loading: bool,
+    ) -> None:
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content.set_halign(Gtk.Align.CENTER)
+        content.set_valign(Gtk.Align.CENTER)
+        content.set_size_request(THUMB_WIDTH, THUMB_HEIGHT)
+
+        if loading:
+            spinner = Gtk.Spinner()
+            spinner.start()
+            content.append(spinner)
+
+            title = Gtk.Label(label="Loading...")
+            title.add_css_class("section-heading")
+            content.append(title)
+        else:
+            icon = Gtk.Image.new_from_icon_name("view-more-symbolic")
+            icon.set_pixel_size(24)
+            content.append(icon)
+
+            title = Gtk.Label(label="Load Older")
+            title.add_css_class("section-heading")
+            content.append(title)
+
+        label = Gtk.Label(label=f"{hidden_count} hidden")
+        label.add_css_class("muted")
+        content.append(label)
+        button.set_child(content)
+
+    def on_load_older_clicked(
+        self,
+        button: Gtk.Button,
+        limit_key: str,
+        hidden_count: int,
+    ) -> None:
+        if limit_key in self.loading_more_keys:
+            return
+
+        scroller = self.scroller_for_thumbnail_limit(limit_key)
+        scroll_value = scroller.get_vadjustment().get_value() if scroller is not None else None
+        self.loading_more_keys.add(limit_key)
+        button.set_sensitive(False)
+        self.set_load_older_button_content(button, hidden_count, loading=True)
+        GLib.timeout_add(
+            LOAD_MORE_DELAY_MS,
+            self.perform_load_older,
+            limit_key,
+            scroller,
+            scroll_value,
+        )
+
+    def perform_load_older(
+        self,
+        limit_key: str,
+        scroller: Gtk.ScrolledWindow | None,
+        scroll_value: float | None,
+    ) -> bool:
+        self.thumbnail_limits[limit_key] = self.thumbnail_limits.get(
+            limit_key,
+            THUMBNAIL_BATCH_SIZE,
+        ) + THUMBNAIL_BATCH_SIZE
+        self.invalidate_thumbnail_context(limit_key)
+        self.loading_more_keys.discard(limit_key)
+        if self.selected_profile is not None:
+            self.refresh_profile_view(force_media=True)
+        if scroller is not None and scroll_value is not None:
+            GLib.idle_add(self.restore_scroller_position, scroller, scroll_value, 2)
+        return False
+
+    def scroller_for_thumbnail_limit(self, limit_key: str) -> Gtk.ScrolledWindow | None:
+        if limit_key == self.selected_profile:
+            return self.thumb_scroller
+
+        paths = self.selected_paths()
+        if paths is None or self.current_converted_set is None:
+            return None
+
+        if limit_key == converted_context_key(paths.name, self.current_converted_set.name):
+            return self.converted_detail_scroller
+        return None
+
+    def restore_scroller_position(
+        self,
+        scroller: Gtk.ScrolledWindow,
+        value: float,
+        retries: int,
+    ) -> bool:
+        adjustment = scroller.get_vadjustment()
+        maximum = max(adjustment.get_lower(), adjustment.get_upper() - adjustment.get_page_size())
+        adjustment.set_value(min(max(value, adjustment.get_lower()), maximum))
+        if retries > 0:
+            GLib.idle_add(self.restore_scroller_position, scroller, value, retries - 1)
+        return False
+
+    def queue_thumbnail(
+        self,
+        paths: ProfilePaths,
+        shot: Path,
+        key: ShotCacheKey,
+        context_key: str,
+    ) -> None:
+        job_key = thumbnail_widget_key(context_key, key)
+        if job_key in self.thumbnail_jobs:
+            return
+
+        self.thumbnail_jobs.add(job_key)
+        self.thumbnail_queue.put((context_key, paths.name, shot, key))
+        if not self.thumbnail_worker_started:
+            self.thumbnail_worker_started = True
+            threading.Thread(
+                target=self.thumbnail_worker,
+                daemon=True,
+            ).start()
+
+    def thumbnail_worker(self) -> None:
+        while True:
+            context_key, profile_name, shot, key = self.thumbnail_queue.get()
+            paths = ProfilePaths.for_name(profile_name)
+            thumbnail: Path | None = None
+            error: str | None = None
+            try:
+                if shot.exists():
+                    thumbnail = create_thumbnail(paths, shot, key)
+            except Exception as exc:
+                error = str(exc)
+            GLib.idle_add(self.thumbnail_ready, context_key, key, thumbnail, error)
+            self.thumbnail_queue.task_done()
+
+    def thumbnail_ready(
+        self,
+        context_key: str,
+        key: ShotCacheKey,
+        thumbnail: Path | None,
+        error: str | None,
+    ) -> bool:
+        job_key = thumbnail_widget_key(context_key, key)
+        self.thumbnail_jobs.discard(job_key)
+        picture = self.thumbnail_pictures.get(job_key)
+        if picture is not None and thumbnail is not None and thumbnail.exists():
+            picture.set_filename(str(thumbnail))
+        elif error:
+            self.toast(f"Could not create thumbnail: {error}")
+        return False
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: LIFECYCLE LISTS AND VIDEO PLAYBACK
+    # Description: Render converted sets and videos, navigate read-only converted
+    #              screenshots, and play videos in an in-app window.
+    # ==========================================================================
+
+    def add_empty_row(self, list_box: Gtk.ListBox, text: str) -> None:
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        label = Gtk.Label(label=text)
+        label.add_css_class("muted")
+        label.set_margin_top(18)
+        label.set_margin_bottom(18)
+        row.set_child(label)
+        list_box.append(row)
+
+    def make_media_row(
+        self,
+        icon_name: str,
+        title_text: str,
+        subtitle_text: str,
+        tooltip: str,
+    ) -> tuple[Gtk.ListBoxRow, Gtk.Box]:
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(True)
+        row.set_tooltip_text(tooltip)
+        row.add_css_class("media-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_tooltip_text(tooltip)
+        row.set_child(box)
+
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.set_pixel_size(20)
+        icon.set_tooltip_text(tooltip)
+        box.append(icon)
+
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text_box.set_hexpand(True)
+        box.append(text_box)
+
+        title = Gtk.Label(label=title_text)
+        title.set_halign(Gtk.Align.START)
+        title.set_ellipsize(3)
+        title.set_tooltip_text(tooltip)
+        text_box.append(title)
+
+        subtitle = Gtk.Label(label=subtitle_text)
+        subtitle.add_css_class("muted")
+        subtitle.set_halign(Gtk.Align.START)
+        subtitle.set_tooltip_text(tooltip)
+        text_box.append(subtitle)
+
+        return row, box
+
+    def refresh_converted_sets(self, paths: ProfilePaths, sets: list[Path]) -> None:
+        clear_container(self.converted_list)
+        if not sets:
+            self.add_empty_row(self.converted_list, "No converted screenshot sets")
+            return
+
+        for converted_set in reversed(sets):
+            count = len(jpg_files(converted_set))
+            pending_video = pending_movie_path(paths, converted_set.name)
+            uploaded_video = uploaded_movie_path(paths, converted_set.name)
+            if pending_video.exists():
+                video_state = "video ready"
+            elif uploaded_video.exists():
+                video_state = "uploaded"
+            else:
+                video_state = "video missing"
+
+            row, box = self.make_media_row(
+                "folder-pictures-symbolic",
+                converted_set_range(converted_set.name),
+                f"{count} frames, {video_state}",
+                converted_set.name,
+            )
+            row.converted_set_path = converted_set
+            self.add_file_drag_source(row, converted_set)
+            box.append(
+                self.make_open_folder_button(
+                    converted_set,
+                    f"Open folder for {converted_set.name}",
+                )
+            )
+            self.converted_list.append(row)
+
+    def converted_set_shots(self, converted_set: Path) -> list[Path]:
+        return jpg_files(converted_set)
+
+    def on_converted_row_activated(self, _list_box: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        converted_set = getattr(row, "converted_set_path", None)
+        if converted_set is None:
+            return
+
+        paths = self.selected_paths()
+        if paths is None:
+            return
+
+        self.current_converted_set = converted_set
+        self.refresh_converted_detail(paths, converted_set)
+        self.lifecycle_stack.set_visible_child_name(PAGE_CONVERTED_DETAIL)
+
+    def on_converted_detail_back(self, _button: Gtk.Button) -> None:
+        self.current_converted_set = None
+        self.lifecycle_stack.set_visible_child_name(PAGE_CONVERTED)
+
+    def refresh_converted_detail(self, paths: ProfilePaths, converted_set: Path) -> None:
+        shots = self.converted_set_shots(converted_set)
+        date_range = converted_set_range(converted_set.name)
+        context_key = converted_context_key(paths.name, converted_set.name)
+        limit = self.thumbnail_limits.get(context_key, THUMBNAIL_BATCH_SIZE)
+
+        self.converted_detail_title.set_label("Converted Screenshot Set")
+        self.converted_detail_subtitle.set_label(f"Read-only - {date_range}")
+        self.converted_detail_title.set_tooltip_text(converted_set.name)
+        self.converted_detail_subtitle.set_tooltip_text(converted_set.name)
+        self.converted_detail_folder_button.set_tooltip_text(
+            f"Open folder for {converted_set.name}"
+        )
+        self.converted_detail_folder_button.set_sensitive(converted_set.exists())
+        self.converted_detail_count.set_label(f"{len(shots)} shots")
+        self.populate_shot_flow(
+            self.converted_detail_flow,
+            paths,
+            shots,
+            context_key,
+            limit,
+            allow_delete=False,
+            load_older_profile=context_key,
+        )
+
+    def refresh_video_list(self, paths: ProfilePaths, videos: list[Path], uploaded: bool) -> None:
+        list_box = self.uploaded_video_list if uploaded else self.pending_video_list
+        clear_container(list_box)
+        if not videos:
+            empty_text = "No uploaded videos" if uploaded else "No videos ready to upload"
+            self.add_empty_row(list_box, empty_text)
+            return
+
+        for video in reversed(videos):
+            try:
+                size_mb = video.stat().st_size / (1024 * 1024)
+                subtitle_text = f"{size_mb:.1f} MB"
+            except FileNotFoundError:
+                subtitle_text = "Missing"
+
+            row, box = self.make_media_row(
+                "video-x-generic-symbolic",
+                display_lapser_name(video.name),
+                subtitle_text,
+                video.name,
+            )
+            row.video_path = video
+            self.add_file_drag_source(row, video)
+
+            box.append(
+                self.make_open_folder_button(
+                    video,
+                    f"Open folder containing {video.name}",
+                )
+            )
+
+            if not uploaded:
+                mark_button = labeled_button(
+                    "checkbox-checked-symbolic",
+                    "Uploaded",
+                    f"Move {video.name} to uploaded",
+                )
+                mark_button.connect("clicked", self.on_mark_uploaded, paths.name, video.name)
+                box.append(mark_button)
+            else:
+                undo_button = labeled_button(
+                    "edit-undo-symbolic",
+                    "Undo",
+                    f"Move {video.name} back to videos not uploaded",
+                )
+                undo_button.connect(
+                    "clicked",
+                    self.confirm_unmark_uploaded,
+                    paths.name,
+                    video.name,
+                )
+                box.append(undo_button)
+
+            list_box.append(row)
+
+    def on_video_row_activated(self, _list_box: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        video_path = getattr(row, "video_path", None)
+        if video_path is not None:
+            self.play_video(video_path)
+
+    def play_video(self, video_path: Path) -> None:
+        if not video_path.exists():
+            self.toast("Video is missing.")
+            return
+
+        display_name = display_lapser_name(video_path.name)
+        window = Adw.Window(application=self.get_application())
+        window.set_title(display_name)
+        window.set_transient_for(self)
+        window.set_default_size(900, 560)
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title=display_name, subtitle=video_path.name))
+        header.pack_end(
+            self.make_open_folder_button(
+                video_path,
+                f"Open folder containing {video_path.name}",
+            )
+        )
+        toolbar.add_top_bar(header)
+
+        media_file = Gtk.MediaFile.new_for_file(Gio.File.new_for_path(str(video_path)))
+        media_file.connect("notify::error", self.on_video_playback_error, video_path)
+
+        video = Gtk.Video.new_for_media_stream(media_file)
+        video.set_autoplay(True)
+        video.set_vexpand(True)
+        video.set_hexpand(True)
+        toolbar.set_content(video)
+
+        window.set_content(toolbar)
+        window.connect("close-request", self.on_video_window_close, media_file)
+        self.video_windows.append(window)
+        window.present()
+        media_file.play()
+
+    def on_video_playback_error(
+        self,
+        media_file: Gtk.MediaFile,
+        _pspec: GObject.GParamSpec,
+        video_path: Path,
+    ) -> None:
+        error = media_file.get_error()
+        if error is not None:
+            self.toast(
+                f"Could not play {display_lapser_name(video_path.name)}: "
+                f"{error.message}"
+            )
+
+    def on_video_window_close(self, window: Adw.Window, media_file: Gtk.MediaFile) -> bool:
+        media_file.pause()
+        if window in self.video_windows:
+            self.video_windows.remove(window)
+        return False
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: PROFILE EDITING
+    # Description: Show/cancel inline profile creation and persist the selected
+    #              profile's "working on" text.
+    # ==========================================================================
+
+    def on_show_create_profile(self, _button: Gtk.Button) -> None:
+        self.create_revealer.set_reveal_child(True)
+        self.new_profile_entry.grab_focus()
+
+    def on_cancel_create_profile(self, _button: Gtk.Button) -> None:
+        self.new_profile_entry.set_text("")
+        self.create_revealer.set_reveal_child(False)
+
+    def on_create_profile(self, _widget: Gtk.Widget) -> None:
+        name = self.new_profile_entry.get_text().strip()
+        if not valid_profile_name(name):
+            self.toast("Profile names cannot be empty or contain '/'.")
+            return
+
+        paths = ProfilePaths.for_name(name)
+        if paths.profile_dir.exists():
+            self.toast("That profile already exists.")
+            return
+
+        paths.ensure()
+        self.new_profile_entry.set_text("")
+        self.create_revealer.set_reveal_child(False)
+        self.selected_profile = name
+        self.refresh_all()
+        self.toast(f"Profile created: {name}")
+
+    def on_working_changed(self, entry: Gtk.Entry) -> None:
+        paths = self.selected_paths()
+        if paths is None:
+            return
+        write_text_file(paths.label_file, entry.get_text())
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: CAPTURE LIFECYCLE
+    # Description: Start and stop screen/window recording, tick active jobs,
+    #              capture one annotated frame, and update running status.
+    # ==========================================================================
+
+    def start_capture(self, mode: str) -> None:
+        paths = self.selected_paths()
+        if paths is None:
+            return
+        if mode == "screen" and not self.dependencies.screen_capture_available:
+            self.toast(
+                self.unavailable_tooltip(
+                    self.dependencies.missing_screen,
+                    "Screen capture is unavailable.",
+                )
+            )
+            return
+        if mode == "window" and not self.dependencies.window_capture_available:
+            self.toast(
+                self.unavailable_tooltip(
+                    self.dependencies.missing_window,
+                    "Window capture is unavailable.",
+                )
+            )
+            return
+        if paths.name in self.jobs:
+            self.toast("This profile is already recording.")
+            return
+
+        label = self.working_entry.get_text()
+        write_text_file(paths.label_file, label)
+
+        try:
+            if mode == "window":
+                self.toast("Choose the target window in the GNOME picker.")
+                backend = PortalWindowCapture()
+            else:
+                backend = FullScreenCapture()
+        except PortalCancelled:
+            self.toast("Window selection cancelled.")
+            return
+        except CaptureError as error:
+            self.toast(f"Capture could not start: {error}")
+            return
+
+        now = time.monotonic()
+        job = CaptureJob(
+            profile_name=paths.name,
+            paths=paths,
+            mode=backend.name,
+            backend=backend,
+            label=label,
+            started_at=now,
+            last_capture_at=now - CAPTURE_INTERVAL_SECONDS,
+        )
+        self.jobs[paths.name] = job
+        append_log(paths, "START", label)
+        job.timer_id = GLib.timeout_add_seconds(1, self.on_job_tick, paths.name)
+        self.toast(f"Recording started: {paths.name}")
+        self.refresh_profile_rows()
+        self.refresh_profile_view()
+
+    def on_job_tick(self, profile_name: str) -> bool:
+        job = self.jobs.get(profile_name)
+        if job is None:
+            return False
+        if job.busy:
+            return True
+
+        elapsed = time.monotonic() - job.last_capture_at
+        if elapsed >= CAPTURE_INTERVAL_SECONDS:
+            job.busy = True
+            threading.Thread(
+                target=self.capture_worker,
+                args=(profile_name,),
+                daemon=True,
+            ).start()
+            if self.selected_profile == profile_name:
+                self.refresh_profile_view()
+
+        return True
+
+    def capture_worker(self, profile_name: str) -> None:
+        job = self.jobs.get(profile_name)
+        if job is None:
+            return
+
+        try:
+            self.capture_one(job)
+        except CaptureError as error:
+            GLib.idle_add(self.capture_finished, profile_name, False, str(error))
+            return
+
+        GLib.idle_add(self.capture_finished, profile_name, True, "")
+
+    def capture_finished(self, profile_name: str, success: bool, error_message: str) -> bool:
+        job = self.jobs.get(profile_name)
+        if job is None:
+            return False
+
+        job.busy = False
+        if not success:
+            self.stop_job(profile_name, failed=True)
+            self.toast(f"{profile_name} stopped: {error_message}")
+            return False
+
+        job.shots_taken += 1
+        job.last_capture_at = time.monotonic()
+        if self.selected_profile == profile_name:
+            self.refresh_profile_view()
+        else:
+            self.refresh_profile_rows()
+        return False
+
+    def capture_one(self, job: CaptureJob) -> None:
+        now = timestamp()
+        raw_path = temp_lapser_path("shot", JPG_SUFFIX)
+        final_path = job.paths.shots_current_dir / f"{now}{JPG_SUFFIX}"
+        label = read_text_file(job.paths.label_file)
+
+        job.backend.capture(raw_path)
+        try:
+            result = subprocess.run(
+                [
+                    COMMAND_IMAGEMAGICK_CONVERT,
+                    str(raw_path),
+                    "-gravity",
+                    "Southwest",
+                    "-background",
+                    "black",
+                    "-fill",
+                    "white",
+                    "-splice",
+                    f"0x{SCREENSHOT_ANNOTATION_HEIGHT}",
+                    "-pointsize",
+                    str(SCREENSHOT_ANNOTATION_POINT_SIZE),
+                    "-annotate",
+                    "+0+0",
+                    f"{now}: {label}",
+                    str(final_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            raise CaptureError(
+                f"Could not run {COMMAND_IMAGEMAGICK_CONVERT}: {error}"
+            ) from error
+        finally:
+            raw_path.unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            raise CaptureError(result.stderr.strip() or "Image annotation failed")
+
+    def stop_selected_job(self) -> None:
+        if self.selected_profile:
+            self.stop_job(self.selected_profile)
+
+    def stop_job(self, profile_name: str, failed: bool = False) -> None:
+        job = self.jobs.pop(profile_name, None)
+        if job is None:
+            return
+
+        if job.timer_id is not None:
+            try:
+                GLib.source_remove(job.timer_id)
+            except GLib.Error:
+                pass
+        job.backend.close()
+        append_log(job.paths, "STOP", job.label)
+        if not failed:
+            self.toast(f"Recording stopped: {profile_name}")
+        self.refresh_profile_rows()
+        if self.selected_profile == profile_name:
+            self.refresh_profile_view()
+
+    def refresh_running_status(self) -> bool:
+        paths = self.selected_paths()
+        if paths is not None and paths.name in self.jobs:
+            self.refresh_status_controls(paths, len(current_shot_files(paths)))
+        return True
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: SCREENSHOT SELECTION AND DELETION
+    # Description: Track selected thumbnails, support Delete-key removal, stage
+    #              deleted screenshots, restore undo, and purge expired staging.
+    # ==========================================================================
+
+    def on_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        _state: Gdk.ModifierType,
+    ) -> bool:
+        if keyval != Gdk.KEY_Delete:
+            return False
+
+        focus = self.get_focus()
+        if isinstance(focus, (Gtk.Entry, Gtk.TextView)):
+            return False
+
+        if self.lifecycle_stack.get_visible_child_name() != PAGE_CURRENT:
+            return False
+
+        return self.delete_selected_screenshot()
+
+    def on_thumb_selection_changed(self, flow: Gtk.FlowBox) -> None:
+        selected = flow.get_selected_children()
+        if not selected:
+            return
+
+        shot = getattr(selected[0], "shot_path", None)
+        if shot is not None:
+            self.selected_shot = shot
+
+    def on_thumb_activated(self, _flow: Gtk.FlowBox, child: Gtk.FlowBoxChild) -> None:
+        if getattr(child, "shot_path", None) is None:
+            return
+        self.selected_shot = child.shot_path
+
+    def on_delete_clicked(self, button: Gtk.Button, profile_name: str, shot: Path) -> None:
+        self.delete_screenshot(profile_name, shot)
+
+    def delete_selected_screenshot(self) -> bool:
+        if self.selected_profile is None:
+            return False
+
+        if self.selected_shot is None:
+            selected = self.thumb_flow.get_selected_children()
+            if selected:
+                self.selected_shot = getattr(selected[0], "shot_path", None)
+
+        if self.selected_shot is None:
+            return False
+
+        self.delete_screenshot(self.selected_profile, self.selected_shot)
+        return True
+
+    def successor_after_delete(self, paths: ProfilePaths, shot: Path) -> Path | None:
+        visual_order = list(reversed(current_shot_files(paths)))
+        try:
+            index = visual_order.index(shot)
+        except ValueError:
+            return None
+
+        if index + 1 < len(visual_order):
+            return visual_order[index + 1]
+        if index > 0:
+            return visual_order[index - 1]
+        return None
+
+    def select_visible_shot(self, shot: Path | None) -> None:
+        if shot is None:
+            return
+
+        child = self.thumb_flow.get_first_child()
+        while child is not None:
+            if getattr(child, "shot_path", None) == shot:
+                self.thumb_flow.select_child(child)
+                child.grab_focus()
+                self.selected_shot = shot
+                return
+            child = child.get_next_sibling()
+
+    def delete_screenshot(self, profile_name: str, shot: Path) -> None:
+        token = uuid.uuid4().hex
+        paths = ProfilePaths.for_name(profile_name)
+        paths.ensure()
+        next_shot = self.successor_after_delete(paths, shot)
+        staged = paths.deleted_dir / f"{token}-{shot.name}"
+        try:
+            remove_thumbnail_cache(paths, shot)
+            shutil.move(str(shot), str(staged))
+        except OSError as error:
+            self.toast(f"Could not remove screenshot: {error}")
+            return
+
+        self.pending_deletes[token] = PendingDelete(staged, shot, profile_name)
+        GLib.timeout_add_seconds(DELETE_FINALIZE_DELAY_SECONDS, self.finalize_delete, token)
+
+        toast = Adw.Toast.new("Screenshot removed")
+        toast.set_button_label("Undo")
+        toast.set_action_name("win.undo-delete")
+        toast.set_action_target_value(GLib.Variant("s", token))
+        toast.set_timeout(DELETE_UNDO_TOAST_SECONDS)
+        self.toast_overlay.add_toast(toast)
+
+        self.selected_shot = next_shot
+        self.invalidate_current_shots(profile_name)
+        self.refresh_after_media_change(profile_name)
+        if self.selected_profile == profile_name:
+            self.select_visible_shot(next_shot)
+
+    def on_undo_delete(self, _action: Gio.SimpleAction, parameter: GLib.Variant) -> None:
+        token = parameter.get_string()
+        pending = self.pending_deletes.pop(token, None)
+        if pending is None:
+            self.toast("That screenshot can no longer be restored.")
+            return
+
+        restore_path = pending.original_path
+        if restore_path.exists():
+            restore_path = restore_path.with_name(f"restored-{restore_path.name}")
+
+        try:
+            shutil.move(str(pending.staged_path), str(restore_path))
+        except OSError as error:
+            self.toast(f"Could not restore screenshot: {error}")
+            return
+
+        self.selected_shot = restore_path
+        self.invalidate_current_shots(pending.profile_name)
+        self.refresh_after_media_change(pending.profile_name)
+        self.toast("Screenshot restored.")
+
+    def finalize_delete(self, token: str) -> bool:
+        pending = self.pending_deletes.pop(token, None)
+        if pending and pending.staged_path.exists():
+            pending.staged_path.unlink(missing_ok=True)
+        return False
+
+    def cleanup_old_staged_deletes(self) -> None:
+        cutoff = time.time() - STAGED_DELETE_RETENTION_SECONDS
+        deleted_roots = (DATA_DIR / "profiles").glob("*/.lapser3-deleted")
+        for deleted_root in deleted_roots:
+            if not deleted_root.is_dir():
+                continue
+            for path in deleted_root.iterdir():
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError:
+                    pass
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: CONVERSION LIFECYCLE
+    # Description: Convert current screenshots to a movie, report ffmpeg progress,
+    #              support cancellation, and clean up failed/staged output.
+    # ==========================================================================
+
+    def convert_current(self) -> None:
+        paths = self.selected_paths()
+        if paths is None:
+            return
+        if not self.dependencies.conversion_available:
+            self.toast(
+                self.unavailable_tooltip(
+                    self.dependencies.missing_conversion,
+                    "Video conversion is unavailable.",
+                )
+            )
+            return
+        if paths.name in self.jobs:
+            self.toast("Stop recording before converting.")
+            return
+        if paths.name in self.converting_profiles:
+            self.toast("This profile is already converting.")
+            return
+
+        shots = current_shot_files(paths)
+        if not has_enough_shots_to_convert(shots):
+            self.toast(f"Need at least {MIN_SHOTS_TO_CONVERT} screenshots to convert.")
+            return
+
+        set_name = converted_set_name_for(shots)
+        if set_name is None:
+            self.toast("Could not name the converted set.")
+            return
+
+        converted_dir = converted_set_dir(paths, set_name)
+        movie_path = pending_movie_path(paths, set_name)
+        if converted_dir.exists() or movie_path.exists():
+            self.toast("Converted output already exists.")
+            return
+
+        self.converting_profiles.add(paths.name)
+        self.conversion_progress[paths.name] = 0.0
+        self.cancelled_conversions.discard(paths.name)
+        self.toast(f"Converting {converted_set_range(set_name)}")
+        self.refresh_profile_view()
+        threading.Thread(
+            target=self.convert_current_worker,
+            args=(paths.name, set_name),
+            daemon=True,
+        ).start()
+
+    def cancel_selected_conversion(self) -> None:
+        if self.selected_profile is not None:
+            self.cancel_conversion(self.selected_profile)
+
+    def cancel_conversion(self, profile_name: str) -> None:
+        if profile_name not in self.converting_profiles:
+            return
+
+        self.cancelled_conversions.add(profile_name)
+        process = self.conversion_processes.get(profile_name)
+        if process is not None and process.poll() is None:
+            process.terminate()
+            GLib.timeout_add_seconds(
+                CONVERSION_CANCEL_KILL_DELAY_SECONDS,
+                self.kill_conversion_if_needed,
+                profile_name,
+                process,
+            )
+        self.toast(f"Cancelling conversion: {profile_name}")
+        if self.selected_profile == profile_name:
+            paths = self.selected_paths()
+            if paths is not None:
+                self.refresh_status_controls(paths, len(current_shot_files(paths)))
+
+    def kill_conversion_if_needed(self, profile_name: str, process: subprocess.Popen[str]) -> bool:
+        if self.conversion_processes.get(profile_name) is process and process.poll() is None:
+            process.kill()
+        return False
+
+    def convert_current_worker(self, profile_name: str, set_name: str) -> None:
+        paths = ProfilePaths.for_name(profile_name)
+        targets = conversion_targets(paths, set_name)
+
+        message = ""
+        try:
+            if targets.converted_dir.exists() or targets.movie_path.exists():
+                raise CaptureError("Converted output already exists")
+
+            shots = current_shot_files(paths)
+            if not has_enough_shots_to_convert(shots):
+                raise CaptureError(
+                    f"Need at least {MIN_SHOTS_TO_CONVERT} screenshots to convert"
+                )
+
+            command = [
+                COMMAND_FFMPEG,
+                "-y",
+                "-framerate",
+                str(VIDEO_FRAMERATE),
+                "-pattern_type",
+                "glob",
+                "-i",
+                str(paths.shots_current_dir / f"*{JPG_SUFFIX}"),
+                "-b:v",
+                VIDEO_BITRATE,
+                "-pix_fmt",
+                VIDEO_PIXEL_FORMAT,
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(targets.temporary_video),
+            ]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            self.conversion_processes[profile_name] = process
+            output_lines: list[str] = []
+            total_frames = max(len(shots), 1)
+            total_seconds = total_frames / VIDEO_FRAMERATE
+
+            if process.stdout is not None:
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        output_lines.append(line)
+                    progress = self.ffmpeg_progress_fraction(line, total_frames, total_seconds)
+                    if progress is not None:
+                        GLib.idle_add(self.update_conversion_progress, profile_name, progress)
+
+            return_code = process.wait()
+            self.conversion_processes.pop(profile_name, None)
+
+            if profile_name in self.cancelled_conversions:
+                raise PortalCancelled("Conversion cancelled")
+            if return_code != 0:
+                raise CaptureError(ffmpeg_error_summary(output_lines))
+
+            GLib.idle_add(
+                self.update_conversion_progress,
+                profile_name,
+                POST_ENCODE_PROGRESS,
+            )
+
+            if profile_name in self.cancelled_conversions:
+                raise PortalCancelled("Conversion cancelled")
+
+            targets.staging_dir.mkdir()
+            for shot in shots:
+                if profile_name in self.cancelled_conversions:
+                    raise PortalCancelled("Conversion cancelled")
+                remove_thumbnail_cache(paths, shot)
+                shutil.move(str(shot), str(targets.staging_dir / shot.name))
+            shutil.copy2(paths.log_file, targets.staging_dir / paths.log_file.name)
+            shutil.move(str(targets.temporary_video), str(targets.movie_path))
+            shutil.copy2(targets.staging_dir / "log.txt", targets.log_path)
+            targets.staging_dir.rename(targets.converted_dir)
+            try:
+                paths.log_file.write_text("", encoding="utf-8")
+            except OSError:
+                pass
+
+            GLib.idle_add(self.update_conversion_progress, profile_name, 1.0)
+            message = f"Movie created: {display_lapser_name(targets.movie_path.name)}"
+        except PortalCancelled as error:
+            self.cleanup_failed_conversion(paths, targets)
+            message = str(error)
+        except (CaptureError, OSError, subprocess.SubprocessError) as error:
+            self.cleanup_failed_conversion(paths, targets)
+            message = f"Could not convert current screenshots: {error}"
+
+        GLib.idle_add(self.convert_current_finished, profile_name, message)
+
+    def ffmpeg_progress_fraction(
+        self,
+        line: str,
+        total_frames: int,
+        total_seconds: float,
+    ) -> float | None:
+        if line.startswith("frame="):
+            try:
+                return clamp(
+                    int(line.split("=", 1)[1]) / total_frames,
+                    upper=FFMPEG_PROGRESS_LIMIT,
+                )
+            except ValueError:
+                return None
+
+        if line.startswith(("out_time_ms=", "out_time_us=")):
+            try:
+                elapsed = int(line.split("=", 1)[1]) / 1_000_000
+                return clamp(elapsed / total_seconds, upper=FFMPEG_PROGRESS_LIMIT)
+            except ValueError:
+                return None
+
+        return None
+
+    def cleanup_failed_conversion(
+        self,
+        paths: ProfilePaths,
+        targets: ConversionTargets,
+    ) -> None:
+        targets.temporary_video.unlink(missing_ok=True)
+        targets.movie_path.unlink(missing_ok=True)
+        targets.log_path.unlink(missing_ok=True)
+        if targets.staging_dir.exists():
+            for shot in sorted(targets.staging_dir.glob(f"*{JPG_SUFFIX}")):
+                destination = paths.shots_current_dir / shot.name
+                if not destination.exists():
+                    try:
+                        shutil.move(str(shot), str(destination))
+                    except OSError:
+                        pass
+            shutil.rmtree(targets.staging_dir, ignore_errors=True)
+
+    def update_conversion_progress(self, profile_name: str, progress: float) -> bool:
+        self.conversion_progress[profile_name] = clamp(progress)
+        if self.selected_profile == profile_name:
+            paths = self.selected_paths()
+            if paths is not None:
+                self.refresh_conversion_progress(paths)
+        return False
+
+    def convert_current_finished(self, profile_name: str, message: str) -> bool:
+        self.converting_profiles.discard(profile_name)
+        self.conversion_processes.pop(profile_name, None)
+        self.conversion_progress.pop(profile_name, None)
+        self.cancelled_conversions.discard(profile_name)
+        self.toast(message)
+        self.selected_shot = None
+        self.invalidate_current_shots(profile_name)
+        self.invalidate_video_lifecycle(profile_name)
+        self.refresh_after_media_change(profile_name)
+        return False
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: VIDEO UPLOAD LIFECYCLE
+    # Description: Move videos between not-uploaded and uploaded states, including
+    #              the confirmation flow for undoing a published marker.
+    # ==========================================================================
+
+    def refresh_after_video_lifecycle_change(self, profile_name: str) -> None:
+        self.invalidate_video_lifecycle(profile_name)
+        self.refresh_after_media_change(profile_name)
+
+    def on_mark_uploaded(self, _button: Gtk.Button, profile_name: str, video_name: str) -> None:
+        paths = ProfilePaths.for_name(profile_name)
+        try:
+            move_video_pair(
+                paths.movies_not_uploaded_dir,
+                paths.movies_uploaded_dir,
+                video_name,
+                exists_message="Uploaded video already exists.",
+                log_exists_message="Uploaded video log already exists.",
+            )
+        except CaptureError as error:
+            self.toast(f"Could not mark uploaded: {error}")
+            return
+
+        self.toast(f"Marked uploaded: {display_lapser_name(video_name)}")
+        self.refresh_after_video_lifecycle_change(profile_name)
+
+    def confirm_unmark_uploaded(
+        self,
+        _button: Gtk.Button,
+        profile_name: str,
+        video_name: str,
+    ) -> None:
+        dialog = Adw.MessageDialog.new(
+            self,
+            "Move video back?",
+            (
+                f"Move {display_lapser_name(video_name)} back to "
+                "Videos Not Uploaded?"
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("move-back", "Move Back")
+        dialog.set_close_response("cancel")
+        dialog.set_default_response("cancel")
+        dialog.set_response_appearance("move-back", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", self.on_unmark_uploaded_response, profile_name, video_name)
+        dialog.present()
+
+    def on_unmark_uploaded_response(
+        self,
+        _dialog: Adw.MessageDialog,
+        response: str,
+        profile_name: str,
+        video_name: str,
+    ) -> None:
+        if response == "move-back":
+            self.unmark_uploaded(profile_name, video_name)
+
+    def unmark_uploaded(self, profile_name: str, video_name: str) -> None:
+        paths = ProfilePaths.for_name(profile_name)
+        try:
+            move_video_pair(
+                paths.movies_uploaded_dir,
+                paths.movies_not_uploaded_dir,
+                video_name,
+                missing_message="Uploaded video is missing.",
+                exists_message="Video already exists in Videos Not Uploaded.",
+                log_exists_message="Video log already exists in Videos Not Uploaded.",
+            )
+        except CaptureError as error:
+            self.toast(f"Could not move video back: {error}")
+            return
+
+        self.toast(f"Moved back: {display_lapser_name(video_name)}")
+        self.refresh_after_video_lifecycle_change(profile_name)
+
+    # ==========================================================================
+    # MAIN WINDOW SUBSECTION: TOASTS AND SHUTDOWN
+    # Description: Surface transient messages and release running jobs, conversion
+    #              processes, status timers, and video windows during close.
+    # ==========================================================================
+
+    def toast(self, text: str) -> None:
+        self.toast_overlay.add_toast(Adw.Toast.new(text))
+
+    def close(self) -> bool:
+        for profile_name in list(self.jobs):
+            self.stop_job(profile_name)
+        for profile_name in list(self.converting_profiles):
+            self.cancel_conversion(profile_name)
+        for window in list(self.video_windows):
+            window.close()
+        if self.status_timer_id:
+            GLib.source_remove(self.status_timer_id)
+        return False
+
+
+# ==============================================================================
+# ==============================================================================
+# SECTION: APPLICATION ENTRY POINT
+# DESCRIPTION: Application object, startup CSS installation, activation, and
+#              main() command dispatch.
+# ==============================================================================
+# ==============================================================================
+
+
+class Lapser3Application(Adw.Application):
+    def __init__(self, dependencies: DependencyStatus) -> None:
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.dependencies = dependencies
+        self.window: Lapser3Window | None = None
+
+    def do_startup(self) -> None:
+        Adw.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS.encode("utf-8"))
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display,
+                provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+
+    def do_activate(self) -> None:
+        if self.window is None:
+            self.window = Lapser3Window(self, self.dependencies)
+            self.window.connect("close-request", lambda window: window.close())
+        self.window.present()
+
+
+def main(argv: list[str]) -> int:
+    if "--check-deps" in argv:
+        return run_check_deps()
+
+    dependencies = check_dependencies()
+    if dependencies.has_missing:
+        print(dependencies.summary(), file=sys.stderr)
+
+    app = Lapser3Application(dependencies)
+    return app.run(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
