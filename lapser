@@ -45,7 +45,8 @@
 # MAIN WINDOW
 #   The libadwaita application window, profile sidebar, lifecycle tabs,
 #   filesystem access and drag export, thumbnail grid, video playback, capture
-#   loop, deletion, conversion, and upload state transitions.
+#   loop, deletion, screenshot conversion, manual video generation, and upload
+#   or discard state transitions.
 #
 # APPLICATION ENTRY POINT
 #   Application object, startup CSS installation, activation, and main().
@@ -62,7 +63,9 @@ from __future__ import annotations
 
 import os
 import locale
+import math
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -71,7 +74,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -133,6 +136,16 @@ VIDEO_PIXEL_FORMAT = "yuv420p"
 FFMPEG_PROGRESS_LIMIT = 0.97
 POST_ENCODE_PROGRESS = 0.98
 
+MANUAL_DATETIME_ENTRY_FORMAT = "%Y-%m-%d %H:%M"
+MANUAL_SENTENCE_MAX_LENGTH = 300
+MANUAL_CARD_WIDTH = 640
+MANUAL_CARD_HEIGHT = 360
+MANUAL_CARD_TEXT_WIDTH = 560
+MANUAL_CARD_TEXT_HEIGHT = 280
+MANUAL_CARD_BACKGROUND = "#242424"
+MANUAL_CARD_FONT = "DejaVu-Sans"
+MANUAL_VIDEO_CRF = "30"
+
 SIDEBAR_MIN_WIDTH = 118
 SIDEBAR_ROW_CHROME_WIDTH = 45
 SIDEBAR_HEADER_CHROME_WIDTH = 58
@@ -142,6 +155,7 @@ PAGE_CONVERTED = "converted"
 PAGE_CONVERTED_DETAIL = "converted-detail"
 PAGE_PENDING_VIDEOS = "pending-videos"
 PAGE_UPLOADED_VIDEOS = "uploaded-videos"
+PAGE_DISCARDED_VIDEOS = "discarded-videos"
 
 LAPSER_TIMESTAMP_FORMAT = "%Y-%m-%d_%H.%M.%S"
 CONVERTED_SET_SEPARATOR = "_TO_"
@@ -151,8 +165,18 @@ LOG_SUFFIX = ".log"
 TEMP_JPG_SUFFIX = ".tmp.jpg"
 MEDIA_SUFFIXES = {JPG_SUFFIX, ".jpeg", VIDEO_SUFFIX, LOG_SUFFIX}
 
+BILLED_CLOCK_RE = re.compile(
+    r"^(?P<hours>\d+):(?P<minutes>[0-5]?\d)(?::(?P<seconds>[0-5]?\d(?:\.\d+)?))?$"
+)
+BILLED_TIME_PART_RE = re.compile(
+    r"(?P<value>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)",
+    re.IGNORECASE,
+)
+
 COMMAND_IMAGEMAGICK_CONVERT = "convert"
 COMMAND_FFMPEG = "ffmpeg"
+COMMAND_FFPROBE = "ffprobe"
 COMMAND_GNOME_SCREENSHOT = "gnome-screenshot"
 COMMAND_GSETTINGS = "gsettings"
 DEPENDENCY_IMAGEMAGICK_CONVERT = "ImageMagick convert"
@@ -188,6 +212,7 @@ ShotCacheKey = SignatureEntry
 ThumbnailSignature = tuple[MediaSignature, int]
 ThumbnailWidgetKey = tuple[str, str, int, int]
 ThumbnailQueueItem = tuple[str, str, Path, ShotCacheKey]
+VideoDurationCacheKey = tuple[str, int, int]
 
 
 # ==============================================================================
@@ -271,6 +296,16 @@ CSS = """
   margin-top: -8px;
 }
 
+.billing-row {
+  background: alpha(currentColor, 0.055);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.billing-value {
+  font-weight: 700;
+}
+
 .dependency-details {
   margin-top: -10px;
 }
@@ -312,6 +347,7 @@ class ProfilePaths:
     name: str
     profile_dir: Path
     label_file: Path
+    already_billed_file: Path
     config_file: Path
     log_file: Path
     shots_current_dir: Path
@@ -319,6 +355,7 @@ class ProfilePaths:
     shots_converted_dir: Path
     movies_not_uploaded_dir: Path
     movies_uploaded_dir: Path
+    movies_discarded_dir: Path
     deleted_dir: Path
     thumbnail_dir: Path
 
@@ -329,6 +366,7 @@ class ProfilePaths:
             name=name,
             profile_dir=profile_dir,
             label_file=profile_dir / "working_on.txt",
+            already_billed_file=profile_dir / "already_billed.txt",
             config_file=profile_dir / "config.cfg",
             log_file=profile_dir / "log.txt",
             shots_current_dir=profile_dir / "current_shots",
@@ -336,6 +374,7 @@ class ProfilePaths:
             shots_converted_dir=profile_dir / "shots_archived_converted",
             movies_not_uploaded_dir=profile_dir / "movies_not_uploaded",
             movies_uploaded_dir=profile_dir / "movies_uploaded",
+            movies_discarded_dir=profile_dir / "movies_discarded",
             deleted_dir=profile_dir / ".lapser3-deleted",
             thumbnail_dir=profile_dir / ".lapser3-thumbnails",
         )
@@ -349,12 +388,18 @@ class ProfilePaths:
             self.shots_converted_dir,
             self.movies_not_uploaded_dir,
             self.movies_uploaded_dir,
+            self.movies_discarded_dir,
             self.deleted_dir,
             self.thumbnail_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
-        for file_path in (self.label_file, self.log_file, self.config_file):
+        for file_path in (
+            self.label_file,
+            self.already_billed_file,
+            self.log_file,
+            self.config_file,
+        ):
             file_path.touch(exist_ok=True)
 
 
@@ -372,6 +417,26 @@ class ConversionTargets:
     movie_path: Path
     log_path: Path
     temporary_video: Path
+
+
+@dataclass(frozen=True)
+class ManualVideoRequest:
+    profile_name: str
+    started: datetime
+    finished: datetime
+    sentence: str
+    set_name: str
+    work_seconds: float
+    video_seconds: float
+
+
+@dataclass(frozen=True)
+class ManualVideoTargets:
+    movie_path: Path
+    log_path: Path
+    temporary_card: Path
+    temporary_video: Path
+    temporary_log: Path
 
 
 @dataclass(frozen=True)
@@ -444,6 +509,21 @@ class DependencyStatus:
         )
 
 
+@dataclass(frozen=True)
+class WorkSummary:
+    video_count: int
+    video_output_seconds: float
+    video_work_seconds: float
+    screenshot_count: int
+    screenshot_work_seconds: float
+    unreadable_video_count: int
+    unaccounted_video_count: int
+
+    @property
+    def total_work_seconds(self) -> float:
+        return self.video_work_seconds + self.screenshot_work_seconds
+
+
 @dataclass
 class CaptureJob:
     profile_name: str
@@ -473,6 +553,28 @@ class CaptureJob:
 
 def timestamp() -> str:
     return datetime.now().strftime(LAPSER_TIMESTAMP_FORMAT)
+
+
+def lapser_timestamp(value: datetime) -> str:
+    return value.strftime(LAPSER_TIMESTAMP_FORMAT)
+
+
+def manual_datetime_text(value: datetime) -> str:
+    return value.strftime(MANUAL_DATETIME_ENTRY_FORMAT)
+
+
+def parse_manual_datetime(raw: str) -> datetime | None:
+    value = raw.strip()
+    for date_format in (
+        MANUAL_DATETIME_ENTRY_FORMAT,
+        f"{MANUAL_DATETIME_ENTRY_FORMAT}:%S",
+        LAPSER_TIMESTAMP_FORMAT,
+    ):
+        try:
+            return datetime.strptime(value, date_format)
+        except ValueError:
+            continue
+    return None
 
 
 def parse_lapser_timestamp(raw: str) -> datetime | None:
@@ -521,6 +623,57 @@ def display_lapser_name(name: str) -> str:
     return name
 
 
+def format_duration(seconds: float, zero_unit: str = "m") -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total_seconds, 60 * 60)
+    minutes, seconds_part = divmod(remainder, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds_part:
+        parts.append(f"{seconds_part}s")
+    return " ".join(parts) if parts else f"0{zero_unit}"
+
+
+def parse_billed_duration(raw: str) -> float | None:
+    """Parse flexible user-entered billable time and return seconds."""
+    value = raw.strip()
+    if not value:
+        return 0.0
+
+    clock_match = BILLED_CLOCK_RE.fullmatch(value)
+    if clock_match is not None:
+        hours = float(clock_match.group("hours"))
+        minutes = float(clock_match.group("minutes"))
+        seconds_part = float(clock_match.group("seconds") or 0)
+        return hours * 60 * 60 + minutes * 60 + seconds_part
+
+    try:
+        decimal_hours = float(value)
+    except ValueError:
+        decimal_hours = -1
+    if decimal_hours >= 0 and math.isfinite(decimal_hours):
+        return decimal_hours * 60 * 60
+
+    matches = list(BILLED_TIME_PART_RE.finditer(value))
+    if not matches or BILLED_TIME_PART_RE.sub("", value).strip():
+        return None
+
+    total_seconds = 0.0
+    for match in matches:
+        amount = float(match.group("value"))
+        unit = match.group("unit").lower()
+        if unit.startswith("h"):
+            total_seconds += amount * 60 * 60
+        elif unit.startswith("m"):
+            total_seconds += amount * 60
+        else:
+            total_seconds += amount
+    return total_seconds
+
+
 def converted_context_key(profile_name: str, set_name: str) -> str:
     return f"{profile_name}:converted:{set_name}"
 
@@ -533,6 +686,28 @@ def converted_set_name_for(shots: list[Path]) -> str | None:
     if not shots:
         return None
     return f"{shots[0].stem}{CONVERTED_SET_SEPARATOR}{shots[-1].stem}"
+
+
+def manual_video_set_name(started: datetime, finished: datetime) -> str:
+    return (
+        f"{lapser_timestamp(started)}{CONVERTED_SET_SEPARATOR}"
+        f"{lapser_timestamp(finished)}"
+    )
+
+
+def manual_video_playback_seconds(work_seconds: float) -> float:
+    return work_seconds / (VIDEO_FRAMERATE * CAPTURE_INTERVAL_SECONDS)
+
+
+def manual_card_point_size(sentence: str) -> int:
+    length = len(sentence)
+    if length <= 60:
+        return 42
+    if length <= 120:
+        return 34
+    if length <= 200:
+        return 28
+    return 24
 
 
 def has_enough_shots_to_convert(shots: list[Path]) -> bool:
@@ -592,6 +767,136 @@ def conversion_targets(paths: ProfilePaths, set_name: str) -> ConversionTargets:
         log_path=paths.movies_not_uploaded_dir / f"{set_name}{LOG_SUFFIX}",
         temporary_video=temp_lapser_path("video", VIDEO_SUFFIX),
     )
+
+
+def manual_video_targets(paths: ProfilePaths, set_name: str) -> ManualVideoTargets:
+    return ManualVideoTargets(
+        movie_path=pending_movie_path(paths, set_name),
+        log_path=paths.movies_not_uploaded_dir / f"{set_name}{LOG_SUFFIX}",
+        temporary_card=temp_lapser_path("manual-card", JPG_SUFFIX),
+        temporary_video=temp_lapser_path("manual-video", VIDEO_SUFFIX),
+        temporary_log=temp_lapser_path("manual-video", LOG_SUFFIX),
+    )
+
+
+def manual_video_conflict(paths: ProfilePaths, set_name: str) -> bool:
+    return any(
+        path.exists()
+        for path in (
+            pending_movie_path(paths, set_name),
+            uploaded_movie_path(paths, set_name),
+            paths.movies_not_uploaded_dir / f"{set_name}{LOG_SUFFIX}",
+            paths.movies_uploaded_dir / f"{set_name}{LOG_SUFFIX}",
+            converted_set_dir(paths, set_name),
+            paths.shots_not_converted_dir / set_name,
+        )
+    )
+
+
+def validate_manual_video_request(
+    paths: ProfilePaths,
+    started_text: str,
+    finished_text: str,
+    sentence_text: str,
+) -> tuple[ManualVideoRequest | None, str]:
+    sentence = " ".join(sentence_text.split())
+    if not sentence:
+        return None, "Enter the sentence to show in the video."
+    if len(sentence) > MANUAL_SENTENCE_MAX_LENGTH:
+        return None, f"Keep the sentence to {MANUAL_SENTENCE_MAX_LENGTH} characters."
+
+    started = parse_manual_datetime(started_text)
+    finished = parse_manual_datetime(finished_text)
+    if started is None or finished is None:
+        return (
+            None,
+            "Use a date and time like "
+            f"{datetime.now().strftime(MANUAL_DATETIME_ENTRY_FORMAT)}.",
+        )
+    if finished <= started:
+        return None, "Finish must be later than start."
+
+    set_name = manual_video_set_name(started, finished)
+    if manual_video_conflict(paths, set_name):
+        return None, "A video or screenshot set already uses this time range."
+
+    work_seconds = (finished - started).total_seconds()
+    video_seconds = manual_video_playback_seconds(work_seconds)
+    request = ManualVideoRequest(
+        profile_name=paths.name,
+        started=started,
+        finished=finished,
+        sentence=sentence,
+        set_name=set_name,
+        work_seconds=work_seconds,
+        video_seconds=video_seconds,
+    )
+    return (
+        request,
+        f"{format_duration(work_seconds)} worked · creates a "
+        f"{format_duration(video_seconds, zero_unit='s')} video",
+    )
+
+
+def render_manual_video_card(sentence: str, target: Path) -> None:
+    point_size = manual_card_point_size(sentence)
+    try:
+        result = subprocess.run(
+            [
+                COMMAND_IMAGEMAGICK_CONVERT,
+                "-size",
+                f"{MANUAL_CARD_TEXT_WIDTH}x{MANUAL_CARD_TEXT_HEIGHT}",
+                "-background",
+                MANUAL_CARD_BACKGROUND,
+                "-fill",
+                "white",
+                "-font",
+                MANUAL_CARD_FONT,
+                "-pointsize",
+                str(point_size),
+                "-gravity",
+                "center",
+                f"caption:{sentence}",
+                "-gravity",
+                "center",
+                "-extent",
+                f"{MANUAL_CARD_WIDTH}x{MANUAL_CARD_HEIGHT}",
+                "-quality",
+                "90",
+                str(target),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise CaptureError(
+            f"Could not run {COMMAND_IMAGEMAGICK_CONVERT}: {error}"
+        ) from error
+    if result.returncode != 0:
+        raise CaptureError(result.stderr.strip() or "Could not create the video card")
+    if not target.exists() or target.stat().st_size == 0:
+        raise CaptureError("ImageMagick did not create the video card")
+
+
+def write_manual_video_log(request: ManualVideoRequest, target: Path) -> None:
+    lines = (
+        f"{lapser_timestamp(request.started)} - START {request.sentence}",
+        f"{lapser_timestamp(request.finished)} - STOP {request.sentence}",
+        (
+            f"{timestamp()} - GENERATED MANUAL VIDEO; "
+            f"worked={format_duration(request.work_seconds)}; "
+            f"video={format_duration(request.video_seconds, zero_unit='s')}"
+        ),
+    )
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cleanup_manual_video_targets(targets: ManualVideoTargets) -> None:
+    targets.temporary_card.unlink(missing_ok=True)
+    targets.temporary_video.unlink(missing_ok=True)
+    targets.temporary_log.unlink(missing_ok=True)
 
 
 def append_log(paths: ProfilePaths, action: str, label: str) -> None:
@@ -704,6 +1009,57 @@ def jpg_files(directory: Path) -> list[Path]:
         for path in directory.iterdir()
         if path.is_file() and path.suffix.lower() == JPG_SUFFIX
     )
+
+
+def recursive_jpg_count(directory: Path) -> int:
+    if not directory.exists():
+        return 0
+    return sum(
+        1
+        for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() == JPG_SUFFIX
+    )
+
+
+def video_duration_cache_key(video_path: Path) -> VideoDurationCacheKey | None:
+    try:
+        stat = video_path.stat()
+    except FileNotFoundError:
+        return None
+    return (str(video_path), stat.st_size, stat.st_mtime_ns)
+
+
+def probe_video_duration(video_path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            [
+                COMMAND_FFPROBE,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        return None
+    if not math.isfinite(duration) or duration < 0:
+        return None
+    return duration
 
 
 def video_log_path(video_path: Path) -> Path:
@@ -880,6 +1236,25 @@ def labeled_button(
     image = Gtk.Image.new_from_icon_name(icon_name)
     text = Gtk.Label(label=label)
     content.append(image)
+    content.append(text)
+    button.set_child(content)
+    button.set_tooltip_text(tooltip)
+    if css_class:
+        button.add_css_class(css_class)
+    return button
+
+
+def labeled_symbol_button(
+    symbol: str,
+    label: str,
+    tooltip: str,
+    css_class: str | None = None,
+) -> Gtk.Button:
+    button = Gtk.Button()
+    content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    symbol_label = Gtk.Label(label=symbol)
+    text = Gtk.Label(label=label)
+    content.append(symbol_label)
     content.append(text)
     button.set_child(content)
     button.set_tooltip_text(tooltip)
@@ -1225,8 +1600,8 @@ class PortalWindowCapture:
 # SECTION: MAIN WINDOW
 # DESCRIPTION: The libadwaita application window, profile sidebar, lifecycle
 #              tabs, filesystem access and drag export, thumbnail grid, video
-#              playback, capture loop, deletion, conversion, and upload state
-#              transitions.
+#              playback, capture loop, deletion, screenshot conversion, manual
+#              video generation, and upload or discard state transitions.
 # ==============================================================================
 # ==============================================================================
 
@@ -1251,6 +1626,7 @@ class Lapser3Window(Adw.ApplicationWindow):
         self.profile_rows: dict[str, Gtk.ListBoxRow] = {}
         self.pending_deletes: dict[str, PendingDelete] = {}
         self.converting_profiles: set[str] = set()
+        self.manual_video_profiles: set[str] = set()
         self.conversion_progress: dict[str, float] = {}
         self.conversion_processes: dict[str, subprocess.Popen[str]] = {}
         self.cancelled_conversions: set[str] = set()
@@ -1259,10 +1635,13 @@ class Lapser3Window(Adw.ApplicationWindow):
         self.converted_signatures: dict[str, MediaSignature] = {}
         self.pending_video_signatures: dict[str, MediaSignature] = {}
         self.uploaded_video_signatures: dict[str, MediaSignature] = {}
+        self.discarded_video_signatures: dict[str, MediaSignature] = {}
         self.thumbnail_pictures: dict[ThumbnailWidgetKey, Gtk.Picture] = {}
         self.thumbnail_jobs: set[ThumbnailWidgetKey] = set()
         self.thumbnail_queue: queue.Queue[ThumbnailQueueItem] = queue.Queue()
         self.thumbnail_worker_started = False
+        self.video_duration_cache: dict[VideoDurationCacheKey, float | None] = {}
+        self.work_summaries: dict[str, WorkSummary] = {}
         self.suppress_profile_refresh = False
         self.current_converted_set: Path | None = None
         self.loading_more_keys: set[str] = set()
@@ -1427,11 +1806,57 @@ class Lapser3Window(Adw.ApplicationWindow):
         self.working_entry.connect("changed", self.on_working_changed)
         label_row.append(self.working_entry)
 
+        billing_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        billing_row.add_css_class("billing-row")
+        self.content.append(billing_row)
+
+        worked_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        worked_box.set_hexpand(True)
+        billing_row.append(worked_box)
+
+        worked_caption = Gtk.Label(label="Total worked")
+        worked_caption.add_css_class("muted")
+        worked_caption.set_halign(Gtk.Align.START)
+        worked_box.append(worked_caption)
+
+        self.total_worked_label = Gtk.Label(label="0m")
+        self.total_worked_label.add_css_class("billing-value")
+        self.total_worked_label.set_halign(Gtk.Align.START)
+        worked_box.append(self.total_worked_label)
+
+        billed_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        billing_row.append(billed_box)
+
+        billed_caption = Gtk.Label(label="Already billed")
+        billed_caption.add_css_class("muted")
+        billed_caption.set_halign(Gtk.Align.START)
+        billed_box.append(billed_caption)
+
+        self.already_billed_entry = Gtk.Entry()
+        self.already_billed_entry.set_placeholder_text("e.g. 2h 30m")
+        self.already_billed_entry.set_width_chars(13)
+        self.already_billed_entry.connect("changed", self.on_already_billed_changed)
+        billed_box.append(self.already_billed_entry)
+
+        to_bill_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        to_bill_box.set_hexpand(True)
+        billing_row.append(to_bill_box)
+
+        to_bill_caption = Gtk.Label(label="To bill")
+        to_bill_caption.add_css_class("muted")
+        to_bill_caption.set_halign(Gtk.Align.START)
+        to_bill_box.append(to_bill_caption)
+
+        self.to_bill_label = Gtk.Label(label="0m")
+        self.to_bill_label.add_css_class("billing-value")
+        self.to_bill_label.set_halign(Gtk.Align.START)
+        to_bill_box.append(self.to_bill_label)
+
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.content.append(controls)
 
         self.start_screen_button = labeled_button(
-            "display-symbolic",
+            "media-record-symbolic",
             "Screen",
             "Start full-screen capture for this profile",
             "suggested-action",
@@ -1440,7 +1865,7 @@ class Lapser3Window(Adw.ApplicationWindow):
         controls.append(self.start_screen_button)
 
         self.start_window_button = labeled_button(
-            "window-new-symbolic",
+            "window-restore-symbolic",
             "Window",
             "Start selected-window capture for this profile",
         )
@@ -1461,12 +1886,20 @@ class Lapser3Window(Adw.ApplicationWindow):
         controls.append(spacer)
 
         self.convert_current_button = labeled_button(
-            "video-x-generic-symbolic",
+            "folder-videos-symbolic",
             "Convert",
             "Create a movie from current screenshots",
         )
         self.convert_current_button.connect("clicked", lambda _button: self.convert_current())
         controls.append(self.convert_current_button)
+
+        self.manual_video_button = labeled_button(
+            "document-new-symbolic",
+            "Manual Video",
+            "Create a video for work completed without screen capture",
+        )
+        self.manual_video_button.connect("clicked", self.show_manual_video_dialog)
+        controls.append(self.manual_video_button)
 
         self.conversion_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.conversion_box.add_css_class("conversion-progress")
@@ -1518,7 +1951,7 @@ class Lapser3Window(Adw.ApplicationWindow):
         thumbs_header.append(thumbs_title)
 
         self.current_folder_button = labeled_button(
-            "folder-open-symbolic",
+            "folder-symbolic",
             "Folder",
             "Open current screenshots folder",
         )
@@ -1584,7 +2017,7 @@ class Lapser3Window(Adw.ApplicationWindow):
         converted_detail_header.append(self.converted_detail_count)
 
         self.converted_detail_folder_button = labeled_button(
-            "folder-open-symbolic",
+            "folder-symbolic",
             "Folder",
             "Open converted screenshot set folder",
         )
@@ -1623,6 +2056,16 @@ class Lapser3Window(Adw.ApplicationWindow):
         self.uploaded_video_list.set_activate_on_single_click(False)
         self.uploaded_video_list.connect("row-activated", self.on_video_row_activated)
         self.lifecycle_stack.add_titled(uploaded_page[0], PAGE_UPLOADED_VIDEOS, "Uploaded")
+
+        discarded_page = self.make_list_page("Discarded videos")
+        self.discarded_video_list = discarded_page[1]
+        self.discarded_video_list.set_activate_on_single_click(False)
+        self.discarded_video_list.connect("row-activated", self.on_video_row_activated)
+        self.lifecycle_stack.add_titled(
+            discarded_page[0],
+            PAGE_DISCARDED_VIDEOS,
+            "Discarded",
+        )
 
     def make_list_page(self, title_text: str) -> tuple[Gtk.Box, Gtk.ListBox]:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1678,7 +2121,7 @@ class Lapser3Window(Adw.ApplicationWindow):
     # ==========================================================================
 
     def make_open_folder_button(self, path: Path, tooltip: str) -> Gtk.Button:
-        button = labeled_button("folder-open-symbolic", "Folder", tooltip)
+        button = labeled_button("folder-symbolic", "Folder", tooltip)
         button.connect("clicked", self.open_folder_for_path, path)
         return button
 
@@ -1873,6 +2316,7 @@ class Lapser3Window(Adw.ApplicationWindow):
         self.converted_signatures.pop(profile_name, None)
         self.pending_video_signatures.pop(profile_name, None)
         self.uploaded_video_signatures.pop(profile_name, None)
+        self.discarded_video_signatures.pop(profile_name, None)
 
     def refresh_after_media_change(
         self,
@@ -1895,11 +2339,15 @@ class Lapser3Window(Adw.ApplicationWindow):
         self.working_entry.handler_block_by_func(self.on_working_changed)
         self.working_entry.set_text(read_text_file(paths.label_file))
         self.working_entry.handler_unblock_by_func(self.on_working_changed)
+        self.already_billed_entry.handler_block_by_func(self.on_already_billed_changed)
+        self.already_billed_entry.set_text(read_text_file(paths.already_billed_file))
+        self.already_billed_entry.handler_unblock_by_func(self.on_already_billed_changed)
 
         shots = current_shot_files(paths)
         converted = converted_dirs(paths)
         pending_videos = video_files(paths.movies_not_uploaded_dir)
         uploaded_videos = video_files(paths.movies_uploaded_dir)
+        discarded_videos = video_files(paths.movies_discarded_dir)
         self.refresh_status_controls(paths, len(shots))
 
         shot_signature = shot_list_signature(shots)
@@ -1908,6 +2356,7 @@ class Lapser3Window(Adw.ApplicationWindow):
         converted_signature = self.converted_signature(paths, converted)
         pending_signature = file_signature(pending_videos)
         uploaded_signature = file_signature(uploaded_videos)
+        discarded_signature = file_signature(discarded_videos)
 
         self.shot_count_label.set_label(f"{len(shots)} shots")
         if force_media or self.thumbnail_signatures.get(paths.name) != thumbnail_signature:
@@ -1928,10 +2377,23 @@ class Lapser3Window(Adw.ApplicationWindow):
                 self.refresh_converted_detail(paths, self.current_converted_set)
         if force_media or self.pending_video_signatures.get(paths.name) != pending_signature:
             self.pending_video_signatures[paths.name] = pending_signature
-            self.refresh_video_list(paths, pending_videos, uploaded=False)
+            self.refresh_video_list(paths, pending_videos, state="pending")
         if force_media or self.uploaded_video_signatures.get(paths.name) != uploaded_signature:
             self.uploaded_video_signatures[paths.name] = uploaded_signature
-            self.refresh_video_list(paths, uploaded_videos, uploaded=True)
+            self.refresh_video_list(paths, uploaded_videos, state="uploaded")
+        if (
+            force_media
+            or self.discarded_video_signatures.get(paths.name) != discarded_signature
+        ):
+            self.discarded_video_signatures[paths.name] = discarded_signature
+            self.refresh_video_list(paths, discarded_videos, state="discarded")
+        self.refresh_work_summary(
+            paths,
+            shots,
+            converted,
+            [*pending_videos, *uploaded_videos],
+            discarded_videos,
+        )
 
     def refresh_status_controls(self, paths: ProfilePaths, shot_count: int) -> None:
         job = self.jobs.get(paths.name)
@@ -1944,7 +2406,14 @@ class Lapser3Window(Adw.ApplicationWindow):
             self.status_pill.remove_css_class("quiet-pill")
             self.status_pill.add_css_class("status-pill")
             if paths.name in self.cancelled_conversions:
-                self.profile_subtitle.set_label("Cancelling conversion")
+                if paths.name in self.manual_video_profiles:
+                    self.profile_subtitle.set_label("Cancelling manual video")
+                else:
+                    self.profile_subtitle.set_label("Cancelling conversion")
+            elif paths.name in self.manual_video_profiles:
+                self.profile_subtitle.set_label(
+                    f"Creating manual video ({int(progress * 100)}%)"
+                )
             else:
                 self.profile_subtitle.set_label(f"Creating movie ({int(progress * 100)}%)")
         elif job:
@@ -1992,6 +2461,25 @@ class Lapser3Window(Adw.ApplicationWindow):
                 "Create a movie from current screenshots",
             )
         )
+        manual_missing = tuple(
+            sorted(
+                dict.fromkeys(
+                    (
+                        *self.dependencies.missing_conversion,
+                        *self.dependencies.missing_thumbnail,
+                    )
+                )
+            )
+        )
+        self.manual_video_button.set_sensitive(
+            job is None and not converting and not manual_missing
+        )
+        self.manual_video_button.set_tooltip_text(
+            self.unavailable_tooltip(
+                manual_missing,
+                "Create a video for work completed without screen capture",
+            )
+        )
         self.refresh_conversion_progress(paths)
 
     def refresh_conversion_progress(self, paths: ProfilePaths) -> None:
@@ -2001,11 +2489,163 @@ class Lapser3Window(Adw.ApplicationWindow):
 
         progress = clamp(self.conversion_progress.get(paths.name, 0.0))
         cancelling = paths.name in self.cancelled_conversions
+        manual_video = paths.name in self.manual_video_profiles
         self.conversion_box.set_visible(True)
-        self.conversion_label.set_label("Cancelling..." if cancelling else "Converting video")
+        if cancelling:
+            label = "Cancelling..."
+        elif manual_video:
+            label = "Creating manual video"
+        else:
+            label = "Converting video"
+        self.conversion_label.set_label(label)
         self.conversion_progress_bar.set_fraction(progress)
         self.conversion_progress_bar.set_text(f"{int(progress * 100)}%")
         self.cancel_conversion_button.set_sensitive(not cancelling)
+        self.cancel_conversion_button.set_tooltip_text(
+            "Cancel manual video" if manual_video else "Cancel conversion"
+        )
+
+    def cached_video_duration(self, video_path: Path) -> float | None:
+        key = video_duration_cache_key(video_path)
+        if key is None:
+            return None
+        if key not in self.video_duration_cache:
+            self.video_duration_cache[key] = probe_video_duration(video_path)
+        return self.video_duration_cache[key]
+
+    def calculate_work_summary(
+        self,
+        paths: ProfilePaths,
+        current_shots: list[Path],
+        converted_sets: list[Path],
+        videos: list[Path],
+        excluded_videos: list[Path] | None = None,
+    ) -> WorkSummary:
+        unique_videos: dict[str, Path] = {}
+        for video in videos:
+            unique_videos.setdefault(video.name, video)
+
+        converted_by_name = {converted_set.name: converted_set for converted_set in converted_sets}
+        handled_converted_sets = {
+            video.stem for video in (excluded_videos or [])
+        }
+        video_output_seconds = 0.0
+        video_work_seconds = 0.0
+        unreadable_video_count = 0
+        unaccounted_video_count = 0
+        screenshot_count = sum(
+            1 for shot in current_shots if shot.suffix.lower() == JPG_SUFFIX
+        )
+        screenshot_count += recursive_jpg_count(paths.shots_not_converted_dir)
+
+        for video in unique_videos.values():
+            converted_set = converted_by_name.get(video.stem)
+            duration = self.cached_video_duration(video)
+            if duration is not None:
+                video_output_seconds += duration
+                video_work_seconds += (
+                    duration * VIDEO_FRAMERATE * CAPTURE_INTERVAL_SECONDS
+                )
+                if converted_set is not None:
+                    handled_converted_sets.add(converted_set.name)
+                continue
+
+            unreadable_video_count += 1
+            if converted_set is None:
+                unaccounted_video_count += 1
+                continue
+            screenshot_count += len(jpg_files(converted_set))
+            handled_converted_sets.add(converted_set.name)
+
+        for converted_set in converted_sets:
+            if converted_set.name not in handled_converted_sets:
+                screenshot_count += len(jpg_files(converted_set))
+
+        screenshot_work_seconds = screenshot_count * CAPTURE_INTERVAL_SECONDS
+        return WorkSummary(
+            video_count=len(unique_videos),
+            video_output_seconds=video_output_seconds,
+            video_work_seconds=video_work_seconds,
+            screenshot_count=screenshot_count,
+            screenshot_work_seconds=screenshot_work_seconds,
+            unreadable_video_count=unreadable_video_count,
+            unaccounted_video_count=unaccounted_video_count,
+        )
+
+    def refresh_work_summary(
+        self,
+        paths: ProfilePaths,
+        current_shots: list[Path],
+        converted_sets: list[Path],
+        videos: list[Path],
+        excluded_videos: list[Path] | None = None,
+    ) -> None:
+        summary = self.calculate_work_summary(
+            paths,
+            current_shots,
+            converted_sets,
+            videos,
+            excluded_videos,
+        )
+        self.work_summaries[paths.name] = summary
+        self.update_billing_labels(summary)
+
+    def update_billing_labels(self, summary: WorkSummary) -> None:
+        total_text = format_duration(summary.total_work_seconds)
+        if summary.unaccounted_video_count:
+            total_text += "+"
+        self.total_worked_label.set_label(total_text)
+
+        video_word = "video" if summary.video_count == 1 else "videos"
+        shot_word = "screenshot" if summary.screenshot_count == 1 else "screenshots"
+        details = (
+            f"{summary.video_count} {video_word}: "
+            f"{format_duration(summary.video_output_seconds, zero_unit='s')} of timelapse "
+            f"= {format_duration(summary.video_work_seconds)} worked. "
+            f"{summary.screenshot_count} other {shot_word} x "
+            f"{CAPTURE_INTERVAL_SECONDS}s = "
+            f"{format_duration(summary.screenshot_work_seconds)} worked."
+        )
+        if summary.unreadable_video_count:
+            details += (
+                f" {summary.unreadable_video_count} video duration(s) could not be read; "
+                "matching screenshot archives were used when available."
+            )
+        if summary.unaccounted_video_count:
+            details += (
+                f" {summary.unaccounted_video_count} unreadable video(s) had no matching "
+                "screenshot archive and are not included."
+            )
+        self.total_worked_label.set_tooltip_text(details)
+
+        raw_billed = self.already_billed_entry.get_text()
+        billed_seconds = parse_billed_duration(raw_billed)
+        self.already_billed_entry.remove_css_class("error")
+        self.already_billed_entry.set_tooltip_text(
+            "Enter hours as 2h 30m, 2:30, 150m, or 2.5. Saved for this profile."
+        )
+        if billed_seconds is None:
+            self.already_billed_entry.add_css_class("error")
+            self.already_billed_entry.set_tooltip_text(
+                "Could not read this time. Try 2h 30m, 2:30, 150m, or 2.5."
+            )
+            self.to_bill_label.set_label("Check time")
+            self.to_bill_label.set_tooltip_text("The already billed time is not valid.")
+            return
+
+        remaining_seconds = summary.total_work_seconds - billed_seconds
+        if remaining_seconds >= 0:
+            self.to_bill_label.set_label(format_duration(remaining_seconds))
+            self.to_bill_label.set_tooltip_text(
+                f"{format_duration(summary.total_work_seconds)} total minus "
+                f"{format_duration(billed_seconds)} already billed."
+            )
+        else:
+            credit_seconds = abs(remaining_seconds)
+            self.to_bill_label.set_label(f"0m · {format_duration(credit_seconds)} ahead")
+            self.to_bill_label.set_tooltip_text(
+                f"Already billed exceeds tracked work by {format_duration(credit_seconds)}."
+            )
 
     # ==========================================================================
     # MAIN WINDOW SUBSECTION: THUMBNAIL GRID AND LAZY LOADING
@@ -2443,23 +3083,47 @@ class Lapser3Window(Adw.ApplicationWindow):
             load_older_profile=context_key,
         )
 
-    def refresh_video_list(self, paths: ProfilePaths, videos: list[Path], uploaded: bool) -> None:
-        list_box = self.uploaded_video_list if uploaded else self.pending_video_list
+    def refresh_video_list(
+        self,
+        paths: ProfilePaths,
+        videos: list[Path],
+        state: str,
+    ) -> None:
+        if state == "uploaded":
+            list_box = self.uploaded_video_list
+            empty_text = "No uploaded videos"
+        elif state == "discarded":
+            list_box = self.discarded_video_list
+            empty_text = "No discarded videos"
+        else:
+            list_box = self.pending_video_list
+            empty_text = "No videos ready to upload"
         clear_container(list_box)
         if not videos:
-            empty_text = "No uploaded videos" if uploaded else "No videos ready to upload"
             self.add_empty_row(list_box, empty_text)
             return
 
         for video in reversed(videos):
+            duration = self.cached_video_duration(video)
             try:
                 size_mb = video.stat().st_size / (1024 * 1024)
-                subtitle_text = f"{size_mb:.1f} MB"
+                size_text = f"{size_mb:.1f} MB"
             except FileNotFoundError:
-                subtitle_text = "Missing"
+                size_text = "Missing"
+
+            if duration is None:
+                subtitle_text = f"Duration unavailable · {size_text}"
+            else:
+                represented_work = (
+                    duration * VIDEO_FRAMERATE * CAPTURE_INTERVAL_SECONDS
+                )
+                subtitle_text = (
+                    f"{format_duration(duration, zero_unit='s')} video · "
+                    f"{format_duration(represented_work)} worked · {size_text}"
+                )
 
             row, box = self.make_media_row(
-                "video-x-generic-symbolic",
+                "folder-videos-symbolic",
                 display_lapser_name(video.name),
                 subtitle_text,
                 video.name,
@@ -2474,17 +3138,31 @@ class Lapser3Window(Adw.ApplicationWindow):
                 )
             )
 
-            if not uploaded:
-                mark_button = labeled_button(
-                    "checkbox-checked-symbolic",
+            if state == "pending":
+                mark_button = labeled_symbol_button(
+                    "\u2610",
                     "Uploaded",
                     f"Move {video.name} to uploaded",
                 )
                 mark_button.connect("clicked", self.on_mark_uploaded, paths.name, video.name)
                 box.append(mark_button)
-            else:
+
+                discard_button = labeled_button(
+                    "user-trash-symbolic",
+                    "Discard",
+                    f"Move {video.name} to Discarded without deleting it",
+                    "destructive-action",
+                )
+                discard_button.connect(
+                    "clicked",
+                    self.confirm_discard_video,
+                    paths.name,
+                    video.name,
+                )
+                box.append(discard_button)
+            elif state == "uploaded":
                 undo_button = labeled_button(
-                    "edit-undo-symbolic",
+                    "go-previous-symbolic",
                     "Undo",
                     f"Move {video.name} back to videos not uploaded",
                 )
@@ -2495,6 +3173,19 @@ class Lapser3Window(Adw.ApplicationWindow):
                     video.name,
                 )
                 box.append(undo_button)
+            else:
+                restore_button = labeled_button(
+                    "go-previous-symbolic",
+                    "Undo discard",
+                    f"Restore {video.name} to Videos Not Uploaded",
+                )
+                restore_button.connect(
+                    "clicked",
+                    self.restore_discarded_video,
+                    paths.name,
+                    video.name,
+                )
+                box.append(restore_button)
 
             list_box.append(row)
 
@@ -2562,7 +3253,7 @@ class Lapser3Window(Adw.ApplicationWindow):
     # ==========================================================================
     # MAIN WINDOW SUBSECTION: PROFILE EDITING
     # Description: Show/cancel inline profile creation and persist the selected
-    #              profile's "working on" text.
+    #              profile's "working on" and "already billed" text.
     # ==========================================================================
 
     def on_show_create_profile(self, _button: Gtk.Button) -> None:
@@ -2596,6 +3287,15 @@ class Lapser3Window(Adw.ApplicationWindow):
         if paths is None:
             return
         write_text_file(paths.label_file, entry.get_text())
+
+    def on_already_billed_changed(self, entry: Gtk.Entry) -> None:
+        paths = self.selected_paths()
+        if paths is None:
+            return
+        write_text_file(paths.already_billed_file, entry.get_text())
+        summary = self.work_summaries.get(paths.name)
+        if summary is not None:
+            self.update_billing_labels(summary)
 
     # ==========================================================================
     # MAIN WINDOW SUBSECTION: CAPTURE LIFECYCLE
@@ -2936,6 +3636,362 @@ class Lapser3Window(Adw.ApplicationWindow):
                     pass
 
     # ==========================================================================
+    # MAIN WINDOW SUBSECTION: MANUAL VIDEO GENERATION
+    # Description: Collect an uncaptured work period and one-sentence card,
+    #              then create a normal Lapser video and companion log.
+    # ==========================================================================
+
+    def show_manual_video_dialog(self, _button: Gtk.Button) -> None:
+        paths = self.selected_paths()
+        if paths is None:
+            return
+
+        missing = tuple(
+            sorted(
+                dict.fromkeys(
+                    (
+                        *self.dependencies.missing_conversion,
+                        *self.dependencies.missing_thumbnail,
+                    )
+                )
+            )
+        )
+        if missing:
+            self.toast(self.unavailable_tooltip(missing, "Manual video is unavailable."))
+            return
+        if paths.name in self.jobs:
+            self.toast("Stop recording before creating a manual video.")
+            return
+        if paths.name in self.converting_profiles:
+            self.toast("This profile is already creating a video.")
+            return
+
+        finished = datetime.now().replace(second=0, microsecond=0)
+        started = finished - timedelta(hours=1)
+
+        dialog = Adw.MessageDialog.new(
+            self,
+            "Create Manual Video",
+            (
+                "Enter when the work happened and the sentence to display. "
+                "The sentence will wrap automatically."
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("create", "Create Video")
+        dialog.set_close_response("cancel")
+        dialog.set_default_response("create")
+        dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+
+        form = Gtk.Grid()
+        form.set_column_spacing(12)
+        form.set_row_spacing(8)
+        form.set_margin_top(6)
+        form.set_size_request(560, -1)
+
+        started_label = Gtk.Label(label="Started")
+        started_label.set_halign(Gtk.Align.END)
+        form.attach(started_label, 0, 0, 1, 1)
+
+        started_entry = Gtk.Entry()
+        started_entry.set_text(manual_datetime_text(started))
+        started_entry.set_placeholder_text("YYYY-MM-DD HH:MM")
+        started_entry.set_hexpand(True)
+        form.attach(started_entry, 1, 0, 1, 1)
+
+        finished_label = Gtk.Label(label="Finished")
+        finished_label.set_halign(Gtk.Align.END)
+        form.attach(finished_label, 0, 1, 1, 1)
+
+        finished_entry = Gtk.Entry()
+        finished_entry.set_text(manual_datetime_text(finished))
+        finished_entry.set_placeholder_text("YYYY-MM-DD HH:MM")
+        finished_entry.set_hexpand(True)
+        form.attach(finished_entry, 1, 1, 1, 1)
+
+        sentence_label = Gtk.Label(label="Sentence")
+        sentence_label.set_halign(Gtk.Align.END)
+        form.attach(sentence_label, 0, 2, 1, 1)
+
+        sentence_entry = Gtk.Entry()
+        sentence_entry.set_placeholder_text("What did you work on?")
+        sentence_entry.set_max_length(MANUAL_SENTENCE_MAX_LENGTH)
+        sentence_entry.set_hexpand(True)
+        sentence_entry.set_text("Work without video")
+        form.attach(sentence_entry, 1, 2, 1, 1)
+
+        status_label = Gtk.Label(label="")
+        status_label.add_css_class("muted")
+        status_label.set_halign(Gtk.Align.START)
+        status_label.set_wrap(True)
+        form.attach(status_label, 1, 3, 1, 1)
+        dialog.set_extra_child(form)
+
+        for entry in (started_entry, finished_entry, sentence_entry):
+            entry.connect(
+                "changed",
+                self.on_manual_video_form_changed,
+                dialog,
+                paths.name,
+                started_entry,
+                finished_entry,
+                sentence_entry,
+                status_label,
+            )
+        sentence_entry.connect(
+            "activate",
+            self.on_manual_video_sentence_activated,
+            dialog,
+        )
+        dialog.connect(
+            "response",
+            self.on_manual_video_dialog_response,
+            paths.name,
+            started_entry,
+            finished_entry,
+            sentence_entry,
+        )
+        self.update_manual_video_dialog(
+            dialog,
+            paths.name,
+            started_entry,
+            finished_entry,
+            sentence_entry,
+            status_label,
+        )
+        dialog.present()
+        sentence_entry.grab_focus()
+        sentence_entry.select_region(0, -1)
+
+    def on_manual_video_form_changed(
+        self,
+        _entry: Gtk.Entry,
+        dialog: Adw.MessageDialog,
+        profile_name: str,
+        started_entry: Gtk.Entry,
+        finished_entry: Gtk.Entry,
+        sentence_entry: Gtk.Entry,
+        status_label: Gtk.Label,
+    ) -> None:
+        self.update_manual_video_dialog(
+            dialog,
+            profile_name,
+            started_entry,
+            finished_entry,
+            sentence_entry,
+            status_label,
+        )
+
+    def update_manual_video_dialog(
+        self,
+        dialog: Adw.MessageDialog,
+        profile_name: str,
+        started_entry: Gtk.Entry,
+        finished_entry: Gtk.Entry,
+        sentence_entry: Gtk.Entry,
+        status_label: Gtk.Label,
+    ) -> None:
+        paths = ProfilePaths.for_name(profile_name)
+        request, status = validate_manual_video_request(
+            paths,
+            started_entry.get_text(),
+            finished_entry.get_text(),
+            sentence_entry.get_text(),
+        )
+        status_label.set_label(status)
+        dialog.set_response_enabled("create", request is not None)
+
+    def on_manual_video_sentence_activated(
+        self,
+        _entry: Gtk.Entry,
+        dialog: Adw.MessageDialog,
+    ) -> None:
+        if dialog.get_response_enabled("create"):
+            dialog.response("create")
+
+    def on_manual_video_dialog_response(
+        self,
+        _dialog: Adw.MessageDialog,
+        response: str,
+        profile_name: str,
+        started_entry: Gtk.Entry,
+        finished_entry: Gtk.Entry,
+        sentence_entry: Gtk.Entry,
+    ) -> None:
+        if response != "create":
+            return
+
+        paths = ProfilePaths.for_name(profile_name)
+        request, status = validate_manual_video_request(
+            paths,
+            started_entry.get_text(),
+            finished_entry.get_text(),
+            sentence_entry.get_text(),
+        )
+        if request is None:
+            self.toast(status)
+            return
+        self.start_manual_video(request)
+
+    def start_manual_video(self, request: ManualVideoRequest) -> None:
+        paths = ProfilePaths.for_name(request.profile_name)
+        paths.ensure()
+        if request.profile_name in self.jobs:
+            self.toast("Stop recording before creating a manual video.")
+            return
+        if request.profile_name in self.converting_profiles:
+            self.toast("This profile is already creating a video.")
+            return
+        if manual_video_conflict(paths, request.set_name):
+            self.toast("A video or screenshot set already uses this time range.")
+            return
+
+        self.converting_profiles.add(request.profile_name)
+        self.manual_video_profiles.add(request.profile_name)
+        self.conversion_progress[request.profile_name] = 0.0
+        self.cancelled_conversions.discard(request.profile_name)
+        self.toast(
+            f"Creating manual video: {converted_set_range(request.set_name)}"
+        )
+        if self.selected_profile == request.profile_name:
+            self.refresh_profile_view()
+        else:
+            self.refresh_profile_rows()
+        threading.Thread(
+            target=self.manual_video_worker,
+            args=(request,),
+            daemon=True,
+        ).start()
+
+    def manual_video_worker(self, request: ManualVideoRequest) -> None:
+        paths = ProfilePaths.for_name(request.profile_name)
+        targets = manual_video_targets(paths, request.set_name)
+        movie_installed = False
+        log_installed = False
+        message = ""
+
+        try:
+            if manual_video_conflict(paths, request.set_name):
+                raise CaptureError("A video or screenshot set already uses this time range")
+
+            render_manual_video_card(request.sentence, targets.temporary_card)
+            write_manual_video_log(request, targets.temporary_log)
+            if request.profile_name in self.cancelled_conversions:
+                raise PortalCancelled("Manual video cancelled")
+
+            command = [
+                COMMAND_FFMPEG,
+                "-y",
+                "-loop",
+                "1",
+                "-framerate",
+                str(VIDEO_FRAMERATE),
+                "-i",
+                str(targets.temporary_card),
+                "-t",
+                f"{request.video_seconds:.3f}",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-tune",
+                "stillimage",
+                "-preset",
+                "veryfast",
+                "-crf",
+                MANUAL_VIDEO_CRF,
+                "-pix_fmt",
+                VIDEO_PIXEL_FORMAT,
+                "-movflags",
+                "+faststart",
+                "-metadata",
+                f"title={request.sentence}",
+                "-metadata",
+                (
+                    "comment=Manual Lapser video representing "
+                    f"{format_duration(request.work_seconds)} worked"
+                ),
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(targets.temporary_video),
+            ]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            self.conversion_processes[request.profile_name] = process
+            output_lines: list[str] = []
+            total_frames = max(
+                int(math.ceil(request.video_seconds * VIDEO_FRAMERATE)),
+                1,
+            )
+
+            if process.stdout is not None:
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        output_lines.append(line)
+                    progress = self.ffmpeg_progress_fraction(
+                        line,
+                        total_frames,
+                        request.video_seconds,
+                    )
+                    if progress is not None:
+                        GLib.idle_add(
+                            self.update_conversion_progress,
+                            request.profile_name,
+                            progress,
+                        )
+
+            return_code = process.wait()
+            self.conversion_processes.pop(request.profile_name, None)
+            if request.profile_name in self.cancelled_conversions:
+                raise PortalCancelled("Manual video cancelled")
+            if return_code != 0:
+                raise CaptureError(ffmpeg_error_summary(output_lines))
+
+            GLib.idle_add(
+                self.update_conversion_progress,
+                request.profile_name,
+                POST_ENCODE_PROGRESS,
+            )
+            if manual_video_conflict(paths, request.set_name):
+                raise CaptureError("A video or screenshot set now uses this time range")
+
+            shutil.move(str(targets.temporary_log), str(targets.log_path))
+            log_installed = True
+            shutil.move(str(targets.temporary_video), str(targets.movie_path))
+            movie_installed = True
+            GLib.idle_add(self.update_conversion_progress, request.profile_name, 1.0)
+            message = f"Manual video created: {display_lapser_name(targets.movie_path.name)}"
+        except PortalCancelled as error:
+            message = str(error)
+        except (CaptureError, OSError, subprocess.SubprocessError) as error:
+            message = f"Could not create manual video: {error}"
+
+        self.conversion_processes.pop(request.profile_name, None)
+        cleanup_manual_video_targets(targets)
+        if not movie_installed and log_installed:
+            targets.log_path.unlink(missing_ok=True)
+        if movie_installed and not log_installed:
+            targets.movie_path.unlink(missing_ok=True)
+        GLib.idle_add(self.manual_video_finished, request.profile_name, message)
+
+    def manual_video_finished(self, profile_name: str, message: str) -> bool:
+        self.manual_video_profiles.discard(profile_name)
+        self.converting_profiles.discard(profile_name)
+        self.conversion_processes.pop(profile_name, None)
+        self.conversion_progress.pop(profile_name, None)
+        self.cancelled_conversions.discard(profile_name)
+        self.toast(message)
+        self.invalidate_video_lifecycle(profile_name)
+        self.refresh_after_media_change(profile_name)
+        return False
+
+    # ==========================================================================
     # MAIN WINDOW SUBSECTION: CONVERSION LIFECYCLE
     # Description: Convert current screenshots to a movie, report ffmpeg progress,
     #              support cancellation, and clean up failed/staged output.
@@ -3005,7 +4061,10 @@ class Lapser3Window(Adw.ApplicationWindow):
                 profile_name,
                 process,
             )
-        self.toast(f"Cancelling conversion: {profile_name}")
+        if profile_name in self.manual_video_profiles:
+            self.toast(f"Cancelling manual video: {profile_name}")
+        else:
+            self.toast(f"Cancelling conversion: {profile_name}")
         if self.selected_profile == profile_name:
             paths = self.selected_paths()
             if paths is not None:
@@ -3176,14 +4235,96 @@ class Lapser3Window(Adw.ApplicationWindow):
         return False
 
     # ==========================================================================
-    # MAIN WINDOW SUBSECTION: VIDEO UPLOAD LIFECYCLE
-    # Description: Move videos between not-uploaded and uploaded states, including
-    #              the confirmation flow for undoing a published marker.
+    # MAIN WINDOW SUBSECTION: VIDEO LIFECYCLE
+    # Description: Move videos between not-uploaded, uploaded, and permanently
+    #              preserved discarded states.
     # ==========================================================================
 
     def refresh_after_video_lifecycle_change(self, profile_name: str) -> None:
         self.invalidate_video_lifecycle(profile_name)
         self.refresh_after_media_change(profile_name)
+
+    def confirm_discard_video(
+        self,
+        _button: Gtk.Button,
+        profile_name: str,
+        video_name: str,
+    ) -> None:
+        dialog = Adw.MessageDialog.new(
+            self,
+            "Discard video?",
+            (
+                f"Move {display_lapser_name(video_name)} to Discarded? "
+                "The video and its log will be preserved, but its time will no "
+                "longer be included in the project total. You can undo this later."
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("discard", "Discard Video")
+        dialog.set_close_response("cancel")
+        dialog.set_default_response("cancel")
+        dialog.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect(
+            "response",
+            self.on_discard_video_response,
+            profile_name,
+            video_name,
+        )
+        dialog.present()
+
+    def on_discard_video_response(
+        self,
+        _dialog: Adw.MessageDialog,
+        response: str,
+        profile_name: str,
+        video_name: str,
+    ) -> None:
+        if response == "discard":
+            self.discard_video(profile_name, video_name)
+
+    def discard_video(self, profile_name: str, video_name: str) -> None:
+        paths = ProfilePaths.for_name(profile_name)
+        paths.ensure()
+        try:
+            move_video_pair(
+                paths.movies_not_uploaded_dir,
+                paths.movies_discarded_dir,
+                video_name,
+                exists_message="Video already exists in Discarded.",
+                log_exists_message="Video log already exists in Discarded.",
+            )
+        except CaptureError as error:
+            self.toast(f"Could not discard video: {error}")
+            return
+
+        self.toast(f"Discarded, not deleted: {display_lapser_name(video_name)}")
+        self.refresh_after_video_lifecycle_change(profile_name)
+
+    def restore_discarded_video(
+        self,
+        _button: Gtk.Button,
+        profile_name: str,
+        video_name: str,
+    ) -> None:
+        paths = ProfilePaths.for_name(profile_name)
+        paths.ensure()
+        try:
+            move_video_pair(
+                paths.movies_discarded_dir,
+                paths.movies_not_uploaded_dir,
+                video_name,
+                missing_message="Discarded video is missing.",
+                exists_message="Video already exists in Videos Not Uploaded.",
+                log_exists_message=(
+                    "Video log already exists in Videos Not Uploaded."
+                ),
+            )
+        except CaptureError as error:
+            self.toast(f"Could not undo discard: {error}")
+            return
+
+        self.toast(f"Restored: {display_lapser_name(video_name)}")
+        self.refresh_after_video_lifecycle_change(profile_name)
 
     def on_mark_uploaded(self, _button: Gtk.Button, profile_name: str, video_name: str) -> None:
         paths = ProfilePaths.for_name(profile_name)
@@ -3320,4 +4461,7 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    try:
+        raise SystemExit(main(sys.argv))
+    except KeyboardInterrupt:
+        raise SystemExit(130)

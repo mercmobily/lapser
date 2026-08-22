@@ -1,37 +1,60 @@
-# LAPSER
+# Lapser
 
-Lapser is a simple script that comes from my own need to record what I do while programming.
-Reasons:
+Lapser records Linux desktop work as lightweight time-lapse videos. It takes
+one screenshot every 15 seconds and turns the screenshots into an MP4 at four
+frames per second, so one hour of work becomes one minute of video.
 
-* Ability to show your client what you actually did
-* Abliliy to re-watch what you did during development
-* Self-discipline motivated by the feeling of making a documentary about writing your software
+## Features
 
-## Nice features:
+- Full-screen capture and portal-selected window capture
+- Independent profiles with labels and timestamped screenshots
+- Thumbnail browsing, selection, deletion, and undo
+- MP4 conversion with progress and cancellation
+- Separate pending, uploaded, and discarded video views
+- Work-time summaries and manually entered work videos
 
-* Super light. A screencast is really expensive. Lapser isn't
-* It takes one screenshot every 15 seconds. The created video has 4 frames per second. This means that for every second you watch, you watch a minute of real life and for every minute, you watch one hour
-* Ability to have different independent profiles
-* A nice timestamp and specific label is added to each screenshot (and therefore the movie)
-* The screenshots for a timelaps are firstly archived, and then converted to a movie in MP4 format
-* Dependencies are simply ffmpeg, Imagemagick and Yad
+## Single-file source
 
-## Limitations
+All application code, including the GTK stylesheet, is contained in the
+executable [`lapser`](./lapser) file. It does not depend on assets or modules
+from this repository. Runtime data is created under `~/.lapser`.
 
-* Upload of videos to remote server not yet implemented (coming as soon as I need it)
-* Dual monitor is not yet managed
+Lapser is a single-file Python application, not a statically linked binary. It
+still requires the Linux desktop libraries and media tools below.
 
-## Demo
+## Requirements
 
-This is a demo of what will come out. Please note that this _actually_ covers the full development of Lapser: I ran just the script to make 1 screenshot every 15 seconds, and then developed all of the app with the script going. I then fed those screenshots back to Lapser.
+- Python 3 with PyGObject bindings for GTK 4, libadwaita, Pango, and GStreamer
+- `python3-dbus`, an XDG desktop portal, PipeWire, and the relevant GStreamer
+  plugins for selected-window capture
+- `gnome-screenshot` and `gsettings` for full-screen capture
+- ImageMagick's `convert` command for annotations and thumbnails
+- `ffmpeg` and `ffprobe` for video generation and duration reporting
 
-You can see at the beginning how I got stuck (really stuck!) with the problem that FFMPEG will not work properly if the input file has a semicolon in it. The rest of the work was about learning YAD and getting the program to actually work.
+On Ubuntu 24.04, the dependencies can be installed with:
 
-The girl in the background is my wife Chiara.
+```sh
+sudo apt install \
+  python3-gi python3-dbus \
+  gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-pango-1.0 gir1.2-gstreamer-1.0 \
+  gnome-screenshot imagemagick ffmpeg \
+  gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  xdg-desktop-portal xdg-desktop-portal-gnome
+```
 
-[![Lapser in action](http://img.youtube.com/vi/Yj-2S86I6fo/0.jpg)](http://www.youtube.com/watch?v=Yj-2S86I6fo "Lapser in action")
+## Install and run
 
+```sh
+install -Dm755 lapser "$HOME/.local/bin/lapser"
+"$HOME/.local/bin/lapser" --check-deps
+"$HOME/.local/bin/lapser"
+```
 
-## Final notes
+The dependency check reports each unavailable feature separately. Lapser keeps
+all screenshots, logs, and videos locally. Marking a video as uploaded only
+moves it into Lapser's uploaded view; the application does not transfer it to a
+remote service.
 
-I wrote this in less than 2 days, and with very rusty knowledge of bash.
+## License
+
+MIT
